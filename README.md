@@ -1,0 +1,139 @@
+# TenantGate: Low-Latency Distributed Multi-Tenant Rate Limiter & Concurrency Governor
+
+[![CI Pipeline](https://github.com/yoohooshantanu/tenantgate/actions/workflows/ci.yml/badge.svg)](https://github.com/yoohooshantanu/tenantgate/actions)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
+**TenantGate** is a low-latency, distributed multi-tenant rate limiting and concurrent call capacity governor written in Go. It is designed to sit at the edge or ingress of AI voice and telephony infrastructure to prevent API abuse, enforce tier-based quotas, eliminate noisy neighbors, and protect against LLM credit exhaustion.
+
+---
+
+## 1. Architecture Overview
+
+```
+Client / Telephony Gateway (CallRelay / External Carrier)
+                   │
+                   │ POST /v1/check
+                   │ {"tenant_id": "cust_123", "resource": "call.initiate", "cost": 1}
+                   ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│ 1. Concurrent Call Session Governor                                    │
+│    ├── Enforces Max Concurrent Calls per Tenant Tier                   │
+│    └── Prevents resource starvation by noisy neighbors                 │
+└───────────────────────────────────┬────────────────────────────────────┘
+                                    │ Allowed
+                                    ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│ 2. Dual-Layer Rate Limiting Engine                                     │
+│    ├── L1 Fast Path: In-Memory Token Bucket (< 1 µs check)             │
+│    │    └── Instant burst capacity absorption                          │
+│    └── L2 Distributed Sync: Redis Atomic Lua Script (EVALSHA)          │
+│         └── Sliding Window Log across distributed cluster nodes        │
+└───────────────────────────────────┬────────────────────────────────────┘
+                                    │
+                  ┌─────────────────┴─────────────────┐
+                  ▼                                   ▼
+          200 OK (Allowed)                429 Too Many Requests
+    RateLimit-Limit: 6000                 RateLimit-Limit: 6000
+    RateLimit-Remaining: 5990             RateLimit-Remaining: 0
+    RateLimit-Reset: 60                   RateLimit-Reset: 1
+```
+
+---
+
+## 2. Key Technical Capabilities
+
+### A. Dual-Algorithm Rate Limiting
+- **L1 In-Memory Token Bucket**: Employs an atomic in-process token bucket to serve burstable telephony audio chunks in sub-microsecond time (**~869 ns/op**) without incurring network round-trips.
+- **L2 Distributed Sliding Window (Redis Lua Script)**: Enforces precise per-minute requests across distributed gateway nodes using atomic sorted-set (`ZREMRANGEBYSCORE`, `ZCARD`, `ZADD`) transactions.
+
+### B. Concurrent Voice Session Enforcing
+Unlike generic HTTP rate limiters that only count requests per second, TenantGate actively tracks **concurrent active calls**:
+- `call.initiate` increments the active call gauge against the tenant's tier quota (e.g., Free: 5, Growth: 30, Enterprise: 300).
+- When a call completes, `/v1/release` decrements the session counter.
+
+### C. Standard IETF Compliance
+Every evaluation returns standard HTTP rate-limiting headers:
+- `RateLimit-Limit`: Maximum quota for the window.
+- `RateLimit-Remaining`: Remaining credits.
+- `RateLimit-Reset`: Seconds until quota reset.
+
+---
+
+## 3. Microbenchmarks & Latency
+
+Evaluated under high concurrency using Go's native benchmark framework:
+
+```bash
+$ go test -bench="BenchmarkTenantGateL1Check" -benchmem ./tests/...
+BenchmarkTenantGateL1Check-8    1455925    869.1 ns/op    160 B/op    4 allocs/op
+PASS
+ok      github.com/yoohooshantanu/tenantgate/tests    6.718s
+```
+
+- **Evaluation Speed**: **~869 nanoseconds per decision** on the hot path.
+- **Heap Efficiency**: 160 B/op and 4 allocations per check.
+
+---
+
+## 4. Quickstart
+
+### Running Standalone
+```bash
+# Clone the repository
+git clone https://github.com/yoohooshantanu/tenantgate.git
+cd tenantgate
+
+# Run tests
+go test -v ./tests/...
+
+# Start service
+go run ./cmd/server
+```
+
+### Running with Docker Compose
+```bash
+docker compose up --build -d
+```
+
+### Checking Rate Limits
+```bash
+curl -X POST http://localhost:8082/v1/check \
+  -H "Content-Type: application/json" \
+  -d '{
+    "tenant_id": "tenant_enterprise_01",
+    "resource": "call.initiate",
+    "cost": 1
+  }'
+```
+
+### Releasing a Call Slot
+```bash
+curl -X POST http://localhost:8082/v1/release \
+  -H "Content-Type: application/json" \
+  -d '{"tenant_id": "tenant_enterprise_01"}'
+```
+
+---
+
+## 5. Repository Layout
+
+```
+tenantgate/
+├── cmd/server/main.go            # Entrypoint, route handlers, IETF headers, graceful shutdown
+├── internal/
+│   ├── model/types.go            # Domain models: QuotaPolicy, TierLevel, RateLimitRequest/Response
+│   ├── cache/l1_cache.go         # In-memory Token Bucket L1 cache (< 1 µs evaluation)
+│   ├── limiter/engine.go         # Atomic Redis Lua sliding window script & concurrency governor
+│   ├── metrics/metrics.go        # Prometheus telemetry exposition (/metrics)
+│   └── logger/logger.go          # Structured slog JSON logger
+├── tests/limiter_test.go         # Burst capacity, concurrent call cap, and parallel load tests
+├── docker-compose.yml            # Multi-container setup with Redis 7
+├── Dockerfile                    # Multi-stage production container build
+└── .github/workflows/ci.yml      # GitHub Actions CI with -race detector
+```
+
+---
+
+## 6. License
+
+MIT License. Authored by Shantanu.

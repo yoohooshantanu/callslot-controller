@@ -1,0 +1,23 @@
+version: '3.8'
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: tenantgate-redis
+    ports:
+      - "6381:6379"
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+
+  tenantgate:
+    build: .
+    container_name: tenantgate-service
+    ports:
+      - "8082:8082"
+    environment:
+      - PORT=8082
+      - REDIS_ADDR=redis:6379
+      - LOG_FORMAT=json
+    depends_on:
+      - redis
+    restart: unless-stopped

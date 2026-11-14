@@ -1,0 +1,16 @@
+# Binaries
+bin/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test artifacts
+*.pprof
+*.test
+*.out
+
+# Environment & IDE
+.env
+.idea/
+.vscode/

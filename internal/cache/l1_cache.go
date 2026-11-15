@@ -12,10 +12,11 @@ type TokenBucketEntry struct {
 
 // L1LocalCache provides zero-network sub-microsecond rate limit evaluation
 type L1LocalCache struct {
-	mu      sync.RWMutex
-	buckets map[string]*TokenBucketEntry
-	ttl     time.Duration
-	stopCh  chan struct{}
+	mu       sync.RWMutex
+	buckets  map[string]*TokenBucketEntry
+	ttl      time.Duration
+	stopCh   chan struct{}
+	stopOnce sync.Once
 }
 
 func NewL1LocalCache(ttl time.Duration) *L1LocalCache {
@@ -30,11 +31,9 @@ func NewL1LocalCache(ttl time.Duration) *L1LocalCache {
 
 // Close gracefully stops background cache eviction
 func (c *L1LocalCache) Close() {
-	select {
-	case <-c.stopCh:
-	default:
+	c.stopOnce.Do(func() {
 		close(c.stopCh)
-	}
+	})
 }
 
 // AllowTokenBucket checks and consumes tokens in local memory

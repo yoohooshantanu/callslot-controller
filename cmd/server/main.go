@@ -56,6 +56,7 @@ func main() {
 			return
 		}
 
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20) // 1MB payload ceiling
 		var req model.RateLimitRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, `{"error":"invalid JSON"}`, http.StatusBadRequest)
@@ -90,6 +91,7 @@ func main() {
 			return
 		}
 
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20) // 1MB payload ceiling
 		var req struct {
 			TenantID string `json:"tenant_id"`
 			Count    int64  `json:"count,omitempty"`

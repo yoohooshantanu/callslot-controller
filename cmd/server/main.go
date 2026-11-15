@@ -70,7 +70,7 @@ func main() {
 
 		// Set IETF standard rate limiting response headers
 		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("RateLimit-Limit", strconv.FormatInt(resp.CurrentUsage+resp.RemainingQuota, 10))
+		w.Header().Set("RateLimit-Limit", strconv.FormatInt(resp.Limit, 10))
 		w.Header().Set("RateLimit-Remaining", strconv.FormatInt(resp.RemainingQuota, 10))
 		w.Header().Set("RateLimit-Reset", strconv.FormatInt(resp.ResetAfterSeconds, 10))
 
@@ -140,5 +140,6 @@ func main() {
 	defer cancel()
 
 	_ = server.Shutdown(ctx)
+	engine.Close()
 	logger.L.Info("tenantgate_terminated_cleanly")
 }

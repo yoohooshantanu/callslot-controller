@@ -28,9 +28,11 @@ redis.call('ZREMRANGEBYSCORE', key, '-inf', now - window)
 local current_count = redis.call('ZCARD', key)
 
 if current_count + cost <= limit then
-    -- Record request entries
+    -- Record request entries with guaranteed unique monotonic sequence
+    local seq = redis.call('INCR', key .. ':seq')
+    redis.call('PEXPIRE', key .. ':seq', window)
     for i = 1, cost do
-        redis.call('ZADD', key, now, now .. '-' .. i .. '-' .. math.random(1000, 9999))
+        redis.call('ZADD', key, now, now .. '-' .. seq .. '-' .. i)
     end
     redis.call('PEXPIRE', key, window)
     return {1, limit - (current_count + cost), current_count + cost}
@@ -44,6 +46,7 @@ type Engine struct {
 	l1Cache       *cache.L1LocalCache
 	rdb           *redis.Client
 	slidingSHA    string
+	policiesMu    sync.RWMutex
 	policies      map[string]*model.QuotaPolicy
 	activeCallsMu sync.RWMutex
 	activeCalls   map[string]int64
@@ -96,15 +99,26 @@ func (e *Engine) registerDefaultPolicies() {
 }
 
 func (e *Engine) SetTenantPolicy(tenantID string, policy *model.QuotaPolicy) {
+	e.policiesMu.Lock()
+	defer e.policiesMu.Unlock()
 	e.policies[tenantID] = policy
 }
 
 func (e *Engine) getPolicy(tenantID string) *model.QuotaPolicy {
+	e.policiesMu.RLock()
+	defer e.policiesMu.RUnlock()
 	if p, ok := e.policies[tenantID]; ok {
 		return p
 	}
 	// Default to Growth tier
 	return e.policies[string(model.TierGrowth)]
+}
+
+// Close releases resources and stops background tasks
+func (e *Engine) Close() {
+	if e.l1Cache != nil {
+		e.l1Cache.Close()
+	}
 }
 
 // Check evaluates rate limits across concurrency caps and rate quotas
@@ -120,6 +134,21 @@ func (e *Engine) Check(ctx context.Context, req *model.RateLimitRequest) (*model
 
 	policy := e.getPolicy(req.TenantID)
 
+	var callSlotReserved bool
+	rollbackCallSlot := func() {
+		if callSlotReserved {
+			e.activeCallsMu.Lock()
+			if e.activeCalls[req.TenantID] >= cost {
+				e.activeCalls[req.TenantID] -= cost
+			} else {
+				e.activeCalls[req.TenantID] = 0
+			}
+			e.activeCallsMu.Unlock()
+			metrics.DefaultMetrics.UpdateActiveCalls(-cost)
+			callSlotReserved = false
+		}
+	}
+
 	// 1. Check Concurrent Calls Cap for call initiation requests
 	if req.Resource == "call.initiate" {
 		e.activeCallsMu.Lock()
@@ -129,6 +158,7 @@ func (e *Engine) Check(ctx context.Context, req *model.RateLimitRequest) (*model
 			metrics.DefaultMetrics.IncCheck(false, true)
 			return &model.RateLimitResponse{
 				Allowed:            false,
+				Limit:              policy.RequestsPerMinute,
 				ActiveCalls:        current,
 				MaxConcurrentCalls: policy.MaxConcurrentCalls,
 				ViolationReason:    fmt.Sprintf("maximum concurrent calls cap reached (%d/%d)", current, policy.MaxConcurrentCalls),
@@ -138,6 +168,7 @@ func (e *Engine) Check(ctx context.Context, req *model.RateLimitRequest) (*model
 		e.activeCalls[req.TenantID] = current + cost
 		e.activeCallsMu.Unlock()
 		metrics.DefaultMetrics.UpdateActiveCalls(cost)
+		callSlotReserved = true
 	}
 
 	// 2. High-speed Fast Path: L1 Token Bucket Cache
@@ -145,10 +176,12 @@ func (e *Engine) Check(ctx context.Context, req *model.RateLimitRequest) (*model
 	l1Allowed, l1Rem := e.l1Cache.AllowTokenBucket(bucketKey, policy.BurstCapacity, policy.RefillRatePerSec, cost)
 
 	if !l1Allowed {
-		// Strict rejection from local burst governor
+		// Strict rejection from local burst governor; release reserved call slot if any
+		rollbackCallSlot()
 		metrics.DefaultMetrics.IncCheck(false, true)
 		return &model.RateLimitResponse{
 			Allowed:           false,
+			Limit:             policy.RequestsPerMinute,
 			RemainingQuota:    0,
 			ResetAfterSeconds: 1,
 			ViolationReason:   "burst capacity token bucket depleted",
@@ -172,10 +205,12 @@ func (e *Engine) Check(ctx context.Context, req *model.RateLimitRequest) (*model
 				metrics.DefaultMetrics.IncCheck(allowed, false)
 				var reason string
 				if !allowed {
+					rollbackCallSlot()
 					reason = fmt.Sprintf("sliding window limit exceeded (%d/%d req/min)", currentUsage, policy.RequestsPerMinute)
 				}
 				return &model.RateLimitResponse{
 					Allowed:           allowed,
+					Limit:             policy.RequestsPerMinute,
 					CurrentUsage:      currentUsage,
 					RemainingQuota:    remaining,
 					ResetAfterSeconds: 60,
@@ -190,6 +225,7 @@ func (e *Engine) Check(ctx context.Context, req *model.RateLimitRequest) (*model
 	metrics.DefaultMetrics.IncCheck(true, true)
 	return &model.RateLimitResponse{
 		Allowed:           true,
+		Limit:             policy.RequestsPerMinute,
 		CurrentUsage:      policy.BurstCapacity - l1Rem,
 		RemainingQuota:    l1Rem,
 		ResetAfterSeconds: 60,

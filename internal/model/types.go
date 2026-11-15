@@ -40,6 +40,7 @@ type RateLimitRequest struct {
 // RateLimitResponse is returned with standard IETF RateLimit headers
 type RateLimitResponse struct {
 	Allowed            bool      `json:"allowed"`
+	Limit              int64     `json:"limit"`
 	CurrentUsage       int64     `json:"current_usage"`
 	RemainingQuota     int64     `json:"remaining_quota"`
 	ResetAfterSeconds  int64     `json:"reset_after_seconds"`

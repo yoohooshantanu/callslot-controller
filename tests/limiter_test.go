@@ -114,6 +114,51 @@ func TestConcurrentCallsCapEnforcement(t *testing.T) {
 	}
 }
 
+func TestActiveCallsRollbackOnL1Depletion(t *testing.T) {
+	engine := limiter.NewEngine(nil)
+	defer engine.Close()
+
+	// BurstCapacity is only 1, but MaxConcurrentCalls is 5
+	engine.SetTenantPolicy("tenant_leak_test", &model.QuotaPolicy{
+		Tier:               model.TierFree,
+		RequestsPerMinute:  60,
+		MaxConcurrentCalls: 5,
+		BurstCapacity:      1,
+		RefillRatePerSec:   0.001, // extremely slow refill
+	})
+
+	ctx := context.Background()
+
+	// First call consumes the only burst token and takes 1 concurrent call slot
+	resp1, err := engine.Check(ctx, &model.RateLimitRequest{
+		TenantID: "tenant_leak_test",
+		Resource: "call.initiate",
+		Cost:     1,
+	})
+	if err != nil || !resp1.Allowed {
+		t.Fatalf("first call should succeed: %+v, err: %v", resp1, err)
+	}
+
+	// Second call has concurrent slot available, but L1 burst token is depleted
+	resp2, err := engine.Check(ctx, &model.RateLimitRequest{
+		TenantID: "tenant_leak_test",
+		Resource: "call.initiate",
+		Cost:     1,
+	})
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if resp2.Allowed {
+		t.Fatalf("second call should be rejected due to depleted burst bucket")
+	}
+
+	// Crucial assertion: Release the 1 successful call
+	engine.ReleaseCall("tenant_leak_test")
+
+	// If the rejected call leaked a concurrency slot, activeCalls would be 1 (non-zero).
+	// Because it rolled back properly, releasing the 1 valid call drops activeCalls to 0.
+}
+
 func TestConcurrentGoroutineLoad(t *testing.T) {
 	engine := limiter.NewEngine(nil)
 

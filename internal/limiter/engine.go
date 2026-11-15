@@ -148,6 +148,9 @@ func (e *Engine) Check(ctx context.Context, req *model.RateLimitRequest) (*model
 			} else {
 				e.activeCalls[req.TenantID] = 0
 			}
+			if e.activeCalls[req.TenantID] == 0 {
+				delete(e.activeCalls, req.TenantID)
+			}
 			e.activeCallsMu.Unlock()
 			metrics.DefaultMetrics.UpdateActiveCalls(-cost)
 			callSlotReserved = false
@@ -262,5 +265,8 @@ func (e *Engine) ReleaseCall(tenantID string, count ...int64) {
 		actual := e.activeCalls[tenantID]
 		e.activeCalls[tenantID] = 0
 		metrics.DefaultMetrics.UpdateActiveCalls(-actual)
+	}
+	if e.activeCalls[tenantID] == 0 {
+		delete(e.activeCalls, tenantID)
 	}
 }

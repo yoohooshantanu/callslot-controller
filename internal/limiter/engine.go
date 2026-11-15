@@ -4,6 +4,7 @@ import (
 	"context"
 	_ "embed"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -200,6 +201,13 @@ func (e *Engine) Check(ctx context.Context, req *model.RateLimitRequest) (*model
 		windowMs := int64(60 * 1000) // 1 minute sliding window
 
 		res, err := e.rdb.EvalSha(ctx, e.slidingSHA, []string{windowKey}, nowMs, windowMs, policy.RequestsPerMinute, cost).Result()
+		if err != nil && strings.HasPrefix(err.Error(), "NOSCRIPT") {
+			// Redis server flushed or restarted; re-load script and re-evaluate
+			if sha, loadErr := e.rdb.ScriptLoad(ctx, SlidingWindowScript).Result(); loadErr == nil {
+				e.slidingSHA = sha
+				res, err = e.rdb.EvalSha(ctx, e.slidingSHA, []string{windowKey}, nowMs, windowMs, policy.RequestsPerMinute, cost).Result()
+			}
+		}
 		if err == nil {
 			if vals, ok := res.([]interface{}); ok && len(vals) == 3 {
 				allowed := vals[0].(int64) == 1

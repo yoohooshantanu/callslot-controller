@@ -127,6 +127,10 @@ func (e *Engine) Check(ctx context.Context, req *model.RateLimitRequest) (*model
 		return nil, model.ErrInvalidRequest
 	}
 
+	if req.Resource == "" {
+		req.Resource = "default"
+	}
+
 	cost := req.Cost
 	if cost <= 0 {
 		cost = 1
@@ -233,13 +237,22 @@ func (e *Engine) Check(ctx context.Context, req *model.RateLimitRequest) (*model
 	}, nil
 }
 
-// ReleaseCall drops the concurrent call counter when a call terminates
-func (e *Engine) ReleaseCall(tenantID string) {
+// ReleaseCall drops the concurrent call counter when calls terminate
+func (e *Engine) ReleaseCall(tenantID string, count ...int64) {
 	e.activeCallsMu.Lock()
 	defer e.activeCallsMu.Unlock()
 
-	if e.activeCalls[tenantID] > 0 {
-		e.activeCalls[tenantID]--
-		metrics.DefaultMetrics.UpdateActiveCalls(-1)
+	delta := int64(1)
+	if len(count) > 0 && count[0] > 0 {
+		delta = count[0]
+	}
+
+	if e.activeCalls[tenantID] >= delta {
+		e.activeCalls[tenantID] -= delta
+		metrics.DefaultMetrics.UpdateActiveCalls(-delta)
+	} else if e.activeCalls[tenantID] > 0 {
+		actual := e.activeCalls[tenantID]
+		e.activeCalls[tenantID] = 0
+		metrics.DefaultMetrics.UpdateActiveCalls(-actual)
 	}
 }

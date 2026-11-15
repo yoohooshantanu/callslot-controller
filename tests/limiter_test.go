@@ -159,6 +159,57 @@ func TestActiveCallsRollbackOnL1Depletion(t *testing.T) {
 	// Because it rolled back properly, releasing the 1 valid call drops activeCalls to 0.
 }
 
+func TestBatchCallAllocationAndRelease(t *testing.T) {
+	engine := limiter.NewEngine(nil)
+	defer engine.Close()
+
+	engine.SetTenantPolicy("tenant_batch_test", &model.QuotaPolicy{
+		Tier:               model.TierGrowth,
+		RequestsPerMinute:  600,
+		MaxConcurrentCalls: 10,
+		BurstCapacity:      50,
+		RefillRatePerSec:   10.0,
+	})
+
+	ctx := context.Background()
+
+	// Reserve batch of 6 concurrent calls
+	resp, err := engine.Check(ctx, &model.RateLimitRequest{
+		TenantID: "tenant_batch_test",
+		Resource: "call.initiate",
+		Cost:     6,
+	})
+	if err != nil || !resp.Allowed {
+		t.Fatalf("expected batch call of 6 to succeed: %+v, err: %v", resp, err)
+	}
+
+	// 5 more should fail because max is 10 (6 + 5 = 11 > 10)
+	resp2, err := engine.Check(ctx, &model.RateLimitRequest{
+		TenantID: "tenant_batch_test",
+		Resource: "call.initiate",
+		Cost:     5,
+	})
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if resp2.Allowed {
+		t.Fatalf("expected batch of 5 to exceed capacity (11 > 10)")
+	}
+
+	// Release 4 slots out of the 6
+	engine.ReleaseCall("tenant_batch_test", 4)
+
+	// Now 5 more should succeed (active was 6 - 4 = 2, 2 + 5 = 7 <= 10)
+	resp3, err := engine.Check(ctx, &model.RateLimitRequest{
+		TenantID: "tenant_batch_test",
+		Resource: "call.initiate",
+		Cost:     5,
+	})
+	if err != nil || !resp3.Allowed {
+		t.Fatalf("expected batch of 5 to succeed after partial release: %+v", resp3)
+	}
+}
+
 func TestConcurrentGoroutineLoad(t *testing.T) {
 	engine := limiter.NewEngine(nil)
 

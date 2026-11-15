@@ -92,13 +92,14 @@ func main() {
 
 		var req struct {
 			TenantID string `json:"tenant_id"`
+			Count    int64  `json:"count,omitempty"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.TenantID == "" {
 			http.Error(w, `{"error":"tenant_id required"}`, http.StatusBadRequest)
 			return
 		}
 
-		engine.ReleaseCall(req.TenantID)
+		engine.ReleaseCall(req.TenantID, req.Count)
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]string{"status": "released"})
 	})

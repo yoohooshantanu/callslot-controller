@@ -4,7 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -708,4 +711,445 @@ func TestLiveRedisReservationRenewal(t *testing.T) {
 	if afterReleaseRenewed {
 		t.Fatalf("expected renew to fail after reservation was released")
 	}
+}
+
+func TestFailClosedRedisMidRun(t *testing.T) {
+	redisAddr := os.Getenv("REDIS_ADDR")
+	if redisAddr == "" {
+		t.Skip("Skipping mid-run Redis failure test: REDIS_ADDR not set")
+	}
+
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed starting proxy listener: %v", err)
+	}
+	proxyAddr := lis.Addr().String()
+
+	var activeConnsMu sync.Mutex
+	var activeConns []net.Conn
+
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		for {
+			clientConn, aErr := lis.Accept()
+			if aErr != nil {
+				return
+			}
+			targetConn, dErr := net.DialTimeout("tcp", redisAddr, time.Second)
+			if dErr != nil {
+				_ = clientConn.Close()
+				return
+			}
+
+			activeConnsMu.Lock()
+			activeConns = append(activeConns, clientConn, targetConn)
+			activeConnsMu.Unlock()
+
+			go func() {
+				_, _ = io.Copy(targetConn, clientConn)
+			}()
+			go func() {
+				_, _ = io.Copy(clientConn, targetConn)
+			}()
+		}
+	}()
+
+	rdb := redis.NewClient(&redis.Options{
+		Addr:        proxyAddr,
+		DialTimeout: 500 * time.Millisecond,
+		ReadTimeout: 500 * time.Millisecond,
+		MaxRetries:  0,
+	})
+	engine := limiter.NewEngine(rdb)
+	defer engine.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	tenantID := fmt.Sprintf("tenant_midrun_%d", time.Now().UnixNano())
+
+	// 1. Initial request while Redis is running succeeds
+	resp1, err := engine.Check(ctx, &model.RateLimitRequest{
+		TenantID: tenantID,
+		Resource: "call.initiate",
+		Cost:     1,
+	})
+	if err != nil || !resp1.Allowed {
+		t.Fatalf("expected initial check to succeed, got: %+v, err: %v", resp1, err)
+	}
+
+	// 2. Abruptly kill Redis mid-run: close proxy listener and sever all active sockets
+	_ = lis.Close()
+	activeConnsMu.Lock()
+	for _, c := range activeConns {
+		_ = c.Close()
+	}
+	activeConnsMu.Unlock()
+	<-serverDone
+
+	// 3. Subsequent request mid-run MUST fail closed and return ErrRedisFailure
+	resp2, err := engine.Check(ctx, &model.RateLimitRequest{
+		TenantID: tenantID,
+		Resource: "call.initiate",
+		Cost:     1,
+	})
+	if err == nil {
+		t.Fatalf("expected error from fail-closed policy when Redis drops mid-run")
+	}
+	if resp2 != nil && resp2.Allowed {
+		t.Fatalf("fail-closed policy must NOT allow requests when Redis dies mid-run")
+	}
+	if !errors.Is(err, model.ErrRedisFailure) {
+		t.Fatalf("expected ErrRedisFailure, got: %v", err)
+	}
+}
+
+func TestRenewalExpiredOrUnknownNeverRecreates(t *testing.T) {
+	// A. In-Memory Mode
+	engineMem := limiter.NewEngine(nil)
+	defer engineMem.Close()
+
+	tenantID := "tenant_renew_test"
+
+	// 1. Unknown reservation returns false and does not create an active reservation
+	if renewed := engineMem.RenewReservation(tenantID, "res_unknown_ghost_id", 3600); renewed {
+		t.Fatalf("expected in-memory renew of unknown ID to return false")
+	}
+	active, _ := engineMem.GetActiveCalls(context.Background(), tenantID)
+	if active != 0 {
+		t.Fatalf("expected 0 active calls after failed renewal of unknown ID, got %d", active)
+	}
+
+	// B. Redis Mode (if REDIS_ADDR available)
+	redisAddr := os.Getenv("REDIS_ADDR")
+	if redisAddr == "" {
+		return
+	}
+
+	rdb := redis.NewClient(&redis.Options{Addr: redisAddr})
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	if err := rdb.Ping(ctx).Err(); err != nil {
+		return
+	}
+
+	engineRedis := limiter.NewEngine(rdb)
+	defer engineRedis.Close()
+
+	redisTenant := fmt.Sprintf("tenant_renew_unit_%d", time.Now().UnixNano())
+	callKey := fmt.Sprintf("cc:res:%s", redisTenant)
+
+	// 2. Unknown reservation on Redis ZSET returns false and creates no member
+	if renewed := engineRedis.RenewReservation(redisTenant, "res_phantom_zset_id", 3600); renewed {
+		t.Fatalf("expected Redis renew of unknown ID to return false")
+	}
+	score, err := rdb.ZScore(ctx, callKey, "res_phantom_zset_id").Result()
+	if err == nil || score > 0 {
+		t.Fatalf("phantom member must not be inserted into Redis ZSET")
+	}
+
+	// 3. Expired reservation (score in past) returns false and is pruned from ZSET
+	pastScore := float64(time.Now().Unix() - 60)
+	_ = rdb.ZAdd(ctx, callKey, redis.Z{Score: pastScore, Member: "res_expired_zset_id"}).Err()
+
+	if renewed := engineRedis.RenewReservation(redisTenant, "res_expired_zset_id", 3600); renewed {
+		t.Fatalf("expected renew of expired reservation to return false")
+	}
+	// Assert member is pruned
+	_, err = rdb.ZScore(ctx, callKey, "res_expired_zset_id").Result()
+	if err == nil {
+		t.Fatalf("expired reservation must be pruned upon renewal attempt")
+	}
+}
+
+func TestConcurrentGoroutinesReservingAtCap(t *testing.T) {
+	// Tests N goroutines concurrently attempting to reserve at capacity
+	engine := limiter.NewEngine(nil)
+	defer engine.Close()
+
+	tenantID := "tenant_race_cap"
+	maxCap := int64(5)
+
+	engine.SetTenantPolicy(tenantID, &model.QuotaPolicy{
+		Tier:               model.TierGrowth,
+		RequestsPerMinute:  100000,
+		MaxConcurrentCalls: maxCap,
+		BurstCapacity:      200,
+		RefillRatePerSec:   1000.0,
+	})
+
+	ctx := context.Background()
+	totalGoroutines := 50
+
+	startCh := make(chan struct{})
+	var wg sync.WaitGroup
+
+	var mu sync.Mutex
+	var successfulIDs []string
+	var blockedCount int
+
+	for i := 0; i < totalGoroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-startCh // Align all goroutines to hit Check simultaneously
+
+			resp, err := engine.Check(ctx, &model.RateLimitRequest{
+				TenantID: tenantID,
+				Resource: "call.initiate",
+				Cost:     1,
+			})
+			if err != nil {
+				return
+			}
+
+			mu.Lock()
+			if resp.Allowed && resp.ReservationID != "" {
+				successfulIDs = append(successfulIDs, resp.ReservationID)
+			} else {
+				blockedCount++
+			}
+			mu.Unlock()
+		}()
+	}
+
+	// Release all goroutines simultaneously
+	close(startCh)
+	wg.Wait()
+
+	// Assert exactly maxCap succeeded, no more
+	if int64(len(successfulIDs)) != maxCap {
+		t.Fatalf("expected exactly %d successful reservations under race, got %d", maxCap, len(successfulIDs))
+	}
+	if blockedCount != totalGoroutines-int(maxCap) {
+		t.Fatalf("expected %d blocked requests, got %d", totalGoroutines-int(maxCap), blockedCount)
+	}
+
+	active, _ := engine.GetActiveCalls(ctx, tenantID)
+	if active != maxCap {
+		t.Fatalf("expected active calls to be %d, got %d", maxCap, active)
+	}
+
+	// Releasing 1 slot allows exactly 1 more reservation
+	engine.ReleaseCall(tenantID, successfulIDs[0])
+	nextResp, err := engine.Check(ctx, &model.RateLimitRequest{
+		TenantID: tenantID,
+		Resource: "call.initiate",
+		Cost:     1,
+	})
+	if err != nil || !nextResp.Allowed {
+		t.Fatalf("expected reservation to succeed after releasing 1 slot: %+v", nextResp)
+	}
+}
+
+func TestReleaseUnknownReservationNoOp(t *testing.T) {
+	engine := limiter.NewEngine(nil)
+	defer engine.Close()
+
+	tenantID := "tenant_noop_release"
+	engine.SetTenantPolicy(tenantID, &model.QuotaPolicy{
+		Tier:               model.TierFree,
+		RequestsPerMinute:  60,
+		MaxConcurrentCalls: 3,
+		BurstCapacity:      10,
+		RefillRatePerSec:   1.0,
+	})
+
+	ctx := context.Background()
+
+	// 1. Reserve legitimate call slot
+	resp, err := engine.Check(ctx, &model.RateLimitRequest{
+		TenantID: tenantID,
+		Resource: "call.initiate",
+		Cost:     1,
+	})
+	if err != nil || !resp.Allowed || resp.ReservationID == "" {
+		t.Fatalf("failed reserving initial call: %+v", resp)
+	}
+
+	// Active calls must be 1
+	active, _ := engine.GetActiveCalls(ctx, tenantID)
+	if active != 1 {
+		t.Fatalf("expected 1 active call, got %d", active)
+	}
+
+	// 2. Release an unknown reservation ID -> safe no-op
+	released := engine.ReleaseCall(tenantID, "res_completely_fake_id_999")
+	if released {
+		t.Fatalf("releasing unknown reservation ID must return false")
+	}
+
+	// Active calls must remain exactly 1 (not decremented)
+	activeAfter, _ := engine.GetActiveCalls(ctx, tenantID)
+	if activeAfter != 1 {
+		t.Fatalf("active calls must remain 1 after no-op release, got %d", activeAfter)
+	}
+
+	// 3. Legitimate reservation can still be released cleanly
+	validReleased := engine.ReleaseCall(tenantID, resp.ReservationID)
+	if !validReleased {
+		t.Fatalf("expected legitimate reservation to release cleanly")
+	}
+
+	activeFinal, _ := engine.GetActiveCalls(ctx, tenantID)
+	if activeFinal != 0 {
+		t.Fatalf("expected 0 active calls after legitimate release, got %d", activeFinal)
+	}
+}
+
+func TestReservationExpiryFreesCapacity(t *testing.T) {
+	redisAddr := os.Getenv("REDIS_ADDR")
+	if redisAddr == "" {
+		t.Skip("Skipping live Redis reservation expiry frees capacity test: REDIS_ADDR not set")
+	}
+
+	rdb := redis.NewClient(&redis.Options{Addr: redisAddr})
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	if err := rdb.Ping(ctx).Err(); err != nil {
+		t.Skipf("cannot ping Redis: %v", err)
+	}
+
+	engine := limiter.NewEngine(rdb)
+	defer engine.Close()
+
+	tenantID := fmt.Sprintf("tenant_expiry_frees_%d", time.Now().UnixNano())
+	callKey := fmt.Sprintf("cc:res:%s", tenantID)
+
+	engine.SetTenantPolicy(tenantID, &model.QuotaPolicy{
+		Tier:               model.TierFree,
+		RequestsPerMinute:  1000,
+		MaxConcurrentCalls: 1, // Cap is strictly 1
+		BurstCapacity:      100,
+		RefillRatePerSec:   100.0,
+	})
+
+	// 1. Reserve Call 1 -> Cap full (1/1)
+	resp1, err := engine.Check(ctx, &model.RateLimitRequest{
+		TenantID: tenantID,
+		Resource: "call.initiate",
+		Cost:     1,
+	})
+	if err != nil || !resp1.Allowed || resp1.ReservationID == "" {
+		t.Fatalf("failed reserving Call 1: %+v", resp1)
+	}
+
+	// 2. Call 2 immediately rejected (1/1 full)
+	blockedResp, err := engine.Check(ctx, &model.RateLimitRequest{
+		TenantID: tenantID,
+		Resource: "call.initiate",
+		Cost:     1,
+	})
+	if err != nil || blockedResp.Allowed {
+		t.Fatalf("expected Call 2 to be blocked by capacity 1/1")
+	}
+
+	// 3. Expire Call 1 by setting score to the past
+	pastSec := float64(time.Now().Unix() - 10)
+	err = rdb.ZAdd(ctx, callKey, redis.Z{Score: pastSec, Member: resp1.ReservationID}).Err()
+	if err != nil {
+		t.Fatalf("failed setting past score: %v", err)
+	}
+
+	// 4. Reserve Call 2 again: engine prunes Call 1, sees active == 0 < 1, and grants slot!
+	resp2, err := engine.Check(ctx, &model.RateLimitRequest{
+		TenantID: tenantID,
+		Resource: "call.initiate",
+		Cost:     1,
+	})
+	if err != nil || !resp2.Allowed || resp2.ReservationID == "" {
+		t.Fatalf("expected Call 2 to succeed after Call 1 expired: %+v, err: %v", resp2, err)
+	}
+
+	// 5. Active calls count is exactly 1 (Call 2 only)
+	active, err := engine.GetActiveCalls(ctx, tenantID)
+	if err != nil || active != 1 {
+		t.Fatalf("expected exactly 1 active call, got %d", active)
+	}
+
+	// Call 1 cannot be released (already expired/pruned); Call 2 releases cleanly
+	if engine.ReleaseCall(tenantID, resp1.ReservationID) {
+		t.Fatalf("releasing already-pruned Call 1 should return false")
+	}
+	if !engine.ReleaseCall(tenantID, resp2.ReservationID) {
+		t.Fatalf("releasing active Call 2 should return true")
+	}
+}
+
+func TestL1BurstScalesPerInstanceVsSharedL2(t *testing.T) {
+	// Demonstrates the architectural trade-off documented in README:
+	// L1 Token Bucket is process-local (<869 ns/op).
+	// Two separate Engine instances each have their own L1 cache.
+	// Therefore, aggregate instantaneous burst capacity across N instances = N * BurstCapacity.
+
+	engineInstance1 := limiter.NewEngine(nil)
+	defer engineInstance1.Close()
+
+	engineInstance2 := limiter.NewEngine(nil)
+	defer engineInstance2.Close()
+
+	tenantID := "tenant_multi_instance_burst"
+	burstCap := int64(3)
+
+	policy := &model.QuotaPolicy{
+		Tier:               model.TierFree,
+		RequestsPerMinute:  1000,
+		MaxConcurrentCalls: 10,
+		BurstCapacity:      burstCap,
+		RefillRatePerSec:   0.0001, // Negligible refill so burst depletion is deterministic
+	}
+
+	engineInstance1.SetTenantPolicy(tenantID, policy)
+	engineInstance2.SetTenantPolicy(tenantID, policy)
+
+	ctx := context.Background()
+
+	// 1. Instance 1 exhausts its 3 burst tokens
+	for i := 0; i < int(burstCap); i++ {
+		resp, err := engineInstance1.Check(ctx, &model.RateLimitRequest{
+			TenantID: tenantID,
+			Resource: "audio.chunk",
+			Cost:     1,
+		})
+		if err != nil || !resp.Allowed {
+			t.Fatalf("Instance 1 request %d should be allowed: %+v", i+1, resp)
+		}
+	}
+
+	// 4th request on Instance 1 is rejected (L1 bucket depleted)
+	blocked1, err := engineInstance1.Check(ctx, &model.RateLimitRequest{
+		TenantID: tenantID,
+		Resource: "audio.chunk",
+		Cost:     1,
+	})
+	if err != nil || blocked1.Allowed {
+		t.Fatalf("expected 4th request on Instance 1 to be blocked by depleted L1 burst")
+	}
+
+	// 2. Instance 2 immediately receives requests: its own local L1 cache has 3 fresh burst tokens!
+	for i := 0; i < int(burstCap); i++ {
+		resp, err := engineInstance2.Check(ctx, &model.RateLimitRequest{
+			TenantID: tenantID,
+			Resource: "audio.chunk",
+			Cost:     1,
+		})
+		if err != nil || !resp.Allowed {
+			t.Fatalf("Instance 2 request %d should be allowed independently: %+v", i+1, resp)
+		}
+	}
+
+	// 4th request on Instance 2 is also rejected
+	blocked2, err := engineInstance2.Check(ctx, &model.RateLimitRequest{
+		TenantID: tenantID,
+		Resource: "audio.chunk",
+		Cost:     1,
+	})
+	if err != nil || blocked2.Allowed {
+		t.Fatalf("expected 4th request on Instance 2 to be blocked by depleted L1 burst")
+	}
+
+	// Combined instantaneous burst absorbed = 3 (Instance 1) + 3 (Instance 2) = 6 = 2 * BurstCapacity
 }

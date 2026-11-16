@@ -10,6 +10,18 @@ jobs:
   test:
     name: Test & Concurrency Race Detection
     runs-on: ubuntu-latest
+
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -24,7 +36,9 @@ jobs:
       - name: Verify Dependencies
         run: go mod verify
 
-      - name: Run Unit & Race Detector Tests
+      - name: Run Unit & Race Detector Tests (Live Redis Container)
+        env:
+          REDIS_ADDR: "localhost:6379"
         run: go test -v -race -timeout 2m ./tests/...
 
       - name: Build Binary

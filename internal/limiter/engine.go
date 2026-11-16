@@ -42,15 +42,48 @@ else
 end
 `
 
+// ReserveCallScript atomically checks and reserves concurrent call capacity in Redis
+const ReserveCallScript = `
+local key = KEYS[1]
+local max_cap = tonumber(ARGV[1])
+local cost = tonumber(ARGV[2])
+
+local current = tonumber(redis.call('GET', key) or "0")
+if current + cost <= max_cap then
+    local new_val = redis.call('INCRBY', key, cost)
+    redis.call('EXPIRE', key, 7200)
+    return {1, new_val}
+else
+    return {0, current}
+end
+`
+
+// ReleaseCallScript atomically decrements concurrent calls in Redis without dropping below zero
+const ReleaseCallScript = `
+local key = KEYS[1]
+local count = tonumber(ARGV[1])
+
+local current = tonumber(redis.call('GET', key) or "0")
+if current <= count then
+    redis.call('DEL', key)
+    return 0
+else
+    local new_val = redis.call('DECRBY', key, count)
+    return new_val
+end
+`
+
 // Engine orchestrates multi-tiered distributed rate limiting & concurrent call caps
 type Engine struct {
-	l1Cache       *cache.L1LocalCache
-	rdb           *redis.Client
-	slidingSHA    string
-	policiesMu    sync.RWMutex
-	policies      map[string]*model.QuotaPolicy
-	activeCallsMu sync.RWMutex
-	activeCalls   map[string]int64
+	l1Cache        *cache.L1LocalCache
+	rdb            *redis.Client
+	slidingSHA     string
+	reserveCallSHA string
+	releaseCallSHA string
+	policiesMu     sync.RWMutex
+	policies       map[string]*model.QuotaPolicy
+	activeCallsMu  sync.RWMutex
+	activeCalls    map[string]int64
 }
 
 func NewEngine(rdb *redis.Client) *Engine {
@@ -66,9 +99,14 @@ func NewEngine(rdb *redis.Client) *Engine {
 	if rdb != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
-		sha, err := rdb.ScriptLoad(ctx, SlidingWindowScript).Result()
-		if err == nil {
+		if sha, err := rdb.ScriptLoad(ctx, SlidingWindowScript).Result(); err == nil {
 			e.slidingSHA = sha
+		}
+		if sha, err := rdb.ScriptLoad(ctx, ReserveCallScript).Result(); err == nil {
+			e.reserveCallSHA = sha
+		}
+		if sha, err := rdb.ScriptLoad(ctx, ReleaseCallScript).Result(); err == nil {
+			e.releaseCallSHA = sha
 		}
 	}
 
@@ -142,41 +180,59 @@ func (e *Engine) Check(ctx context.Context, req *model.RateLimitRequest) (*model
 	var callSlotReserved bool
 	rollbackCallSlot := func() {
 		if callSlotReserved {
-			e.activeCallsMu.Lock()
-			if e.activeCalls[req.TenantID] >= cost {
-				e.activeCalls[req.TenantID] -= cost
-			} else {
-				e.activeCalls[req.TenantID] = 0
-			}
-			if e.activeCalls[req.TenantID] == 0 {
-				delete(e.activeCalls, req.TenantID)
-			}
-			e.activeCallsMu.Unlock()
-			metrics.DefaultMetrics.UpdateActiveCalls(-cost)
+			e.ReleaseCall(req.TenantID, cost)
 			callSlotReserved = false
 		}
 	}
 
 	// 1. Check Concurrent Calls Cap for call initiation requests
 	if req.Resource == "call.initiate" {
-		e.activeCallsMu.Lock()
-		current := e.activeCalls[req.TenantID]
-		if current+cost > policy.MaxConcurrentCalls {
-			e.activeCallsMu.Unlock()
-			metrics.DefaultMetrics.IncCheck(false, true)
-			return &model.RateLimitResponse{
-				Allowed:            false,
-				Limit:              policy.RequestsPerMinute,
-				ActiveCalls:        current,
-				MaxConcurrentCalls: policy.MaxConcurrentCalls,
-				ViolationReason:    fmt.Sprintf("maximum concurrent calls cap reached (%d/%d)", current, policy.MaxConcurrentCalls),
-				CheckedAt:          time.Now().UTC(),
-			}, nil
+		if e.rdb != nil {
+			// Distributed Atomic Concurrency Reservation in Redis
+			callKey := fmt.Sprintf("cc:%s", req.TenantID)
+			res, err := e.evalScript(ctx, e.reserveCallSHA, ReserveCallScript, []string{callKey}, policy.MaxConcurrentCalls, cost)
+			if err == nil {
+				if vals, ok := res.([]interface{}); ok && len(vals) == 2 {
+					allowed := vals[0].(int64) == 1
+					currentCalls := vals[1].(int64)
+					if !allowed {
+						metrics.DefaultMetrics.IncCheck(false, true)
+						return &model.RateLimitResponse{
+							Allowed:            false,
+							Limit:              policy.RequestsPerMinute,
+							ActiveCalls:        currentCalls,
+							MaxConcurrentCalls: policy.MaxConcurrentCalls,
+							ViolationReason:    fmt.Sprintf("maximum concurrent calls cap reached (%d/%d)", currentCalls, policy.MaxConcurrentCalls),
+							CheckedAt:          time.Now().UTC(),
+						}, nil
+					}
+					callSlotReserved = true
+					metrics.DefaultMetrics.UpdateActiveCalls(cost)
+				}
+			}
 		}
-		e.activeCalls[req.TenantID] = current + cost
-		e.activeCallsMu.Unlock()
-		metrics.DefaultMetrics.UpdateActiveCalls(cost)
-		callSlotReserved = true
+
+		if !callSlotReserved && e.rdb == nil {
+			// In-memory fallback concurrency cap
+			e.activeCallsMu.Lock()
+			current := e.activeCalls[req.TenantID]
+			if current+cost > policy.MaxConcurrentCalls {
+				e.activeCallsMu.Unlock()
+				metrics.DefaultMetrics.IncCheck(false, true)
+				return &model.RateLimitResponse{
+					Allowed:            false,
+					Limit:              policy.RequestsPerMinute,
+					ActiveCalls:        current,
+					MaxConcurrentCalls: policy.MaxConcurrentCalls,
+					ViolationReason:    fmt.Sprintf("maximum concurrent calls cap reached (%d/%d)", current, policy.MaxConcurrentCalls),
+					CheckedAt:          time.Now().UTC(),
+				}, nil
+			}
+			e.activeCalls[req.TenantID] = current + cost
+			e.activeCallsMu.Unlock()
+			metrics.DefaultMetrics.UpdateActiveCalls(cost)
+			callSlotReserved = true
+		}
 	}
 
 	// 2. High-speed Fast Path: L1 Token Bucket Cache
@@ -198,19 +254,12 @@ func (e *Engine) Check(ctx context.Context, req *model.RateLimitRequest) (*model
 	}
 
 	// 3. Sliding Window Check (Redis or In-Memory fallback)
-	if e.rdb != nil && e.slidingSHA != "" {
+	if e.rdb != nil {
 		windowKey := fmt.Sprintf("rl:%s:%s", req.TenantID, req.Resource)
 		nowMs := time.Now().UnixMilli()
 		windowMs := int64(60 * 1000) // 1 minute sliding window
 
-		res, err := e.rdb.EvalSha(ctx, e.slidingSHA, []string{windowKey}, nowMs, windowMs, policy.RequestsPerMinute, cost).Result()
-		if err != nil && strings.HasPrefix(err.Error(), "NOSCRIPT") {
-			// Redis server flushed or restarted; re-load script and re-evaluate
-			if sha, loadErr := e.rdb.ScriptLoad(ctx, SlidingWindowScript).Result(); loadErr == nil {
-				e.slidingSHA = sha
-				res, err = e.rdb.EvalSha(ctx, e.slidingSHA, []string{windowKey}, nowMs, windowMs, policy.RequestsPerMinute, cost).Result()
-			}
-		}
+		res, err := e.evalScript(ctx, e.slidingSHA, SlidingWindowScript, []string{windowKey}, nowMs, windowMs, policy.RequestsPerMinute, cost)
 		if err == nil {
 			if vals, ok := res.([]interface{}); ok && len(vals) == 3 {
 				allowed := vals[0].(int64) == 1
@@ -248,25 +297,66 @@ func (e *Engine) Check(ctx context.Context, req *model.RateLimitRequest) (*model
 	}, nil
 }
 
+func (e *Engine) evalScript(ctx context.Context, sha, script string, keys []string, args ...interface{}) (interface{}, error) {
+	if sha != "" {
+		res, err := e.rdb.EvalSha(ctx, sha, keys, args...).Result()
+		if err == nil {
+			return res, nil
+		}
+		if !strings.HasPrefix(err.Error(), "NOSCRIPT") {
+			return nil, err
+		}
+	}
+	return e.rdb.Eval(ctx, script, keys, args...).Result()
+}
+
 // ReleaseCall drops the concurrent call counter when calls terminate
 func (e *Engine) ReleaseCall(tenantID string, count ...int64) {
-	e.activeCallsMu.Lock()
-	defer e.activeCallsMu.Unlock()
-
 	delta := int64(1)
 	if len(count) > 0 && count[0] > 0 {
 		delta = count[0]
 	}
 
+	if e.rdb != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		callKey := fmt.Sprintf("cc:%s", tenantID)
+		_, _ = e.evalScript(ctx, e.releaseCallSHA, ReleaseCallScript, []string{callKey}, delta)
+		metrics.DefaultMetrics.UpdateActiveCalls(-delta)
+	}
+
+	e.activeCallsMu.Lock()
+	defer e.activeCallsMu.Unlock()
+
 	if e.activeCalls[tenantID] >= delta {
 		e.activeCalls[tenantID] -= delta
-		metrics.DefaultMetrics.UpdateActiveCalls(-delta)
+		if e.rdb == nil {
+			metrics.DefaultMetrics.UpdateActiveCalls(-delta)
+		}
 	} else if e.activeCalls[tenantID] > 0 {
 		actual := e.activeCalls[tenantID]
 		e.activeCalls[tenantID] = 0
-		metrics.DefaultMetrics.UpdateActiveCalls(-actual)
+		if e.rdb == nil {
+			metrics.DefaultMetrics.UpdateActiveCalls(-actual)
+		}
 	}
 	if e.activeCalls[tenantID] == 0 {
 		delete(e.activeCalls, tenantID)
 	}
+}
+
+// GetActiveCalls returns current concurrent calls for a tenant
+func (e *Engine) GetActiveCalls(ctx context.Context, tenantID string) (int64, error) {
+	if e.rdb != nil {
+		callKey := fmt.Sprintf("cc:%s", tenantID)
+		val, err := e.rdb.Get(ctx, callKey).Int64()
+		if err == redis.Nil {
+			return 0, nil
+		}
+		return val, err
+	}
+
+	e.activeCallsMu.RLock()
+	defer e.activeCallsMu.RUnlock()
+	return e.activeCalls[tenantID], nil
 }

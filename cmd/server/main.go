@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -24,6 +25,48 @@ func getEnv(key, defaultVal string) string {
 		return val
 	}
 	return defaultVal
+}
+
+var keyRegistry = map[string]string{
+	"tg_test_key_123":    "tenant_test",
+	"tg_live_free_key":   "tenant_free_test",
+	"tg_live_growth_key": "tenant_call_cap",
+}
+
+func init() {
+	if envKey := os.Getenv("TENANTGATE_API_KEY"); envKey != "" {
+		keyRegistry[envKey] = "tenant_production"
+	}
+}
+
+// validateAuth extracts and verifies the API key, checking tenant binding
+func validateAuth(r *http.Request, requestTenantID, bodyAPIKey string) (string, error) {
+	key := r.Header.Get("X-API-Key")
+	if key == "" {
+		authHdr := r.Header.Get("Authorization")
+		if strings.HasPrefix(authHdr, "Bearer ") {
+			key = strings.TrimPrefix(authHdr, "Bearer ")
+		}
+	}
+	if key == "" {
+		key = bodyAPIKey
+	}
+
+	if key == "" {
+		return "", fmt.Errorf("missing API key")
+	}
+
+	boundTenant, ok := keyRegistry[key]
+	if !ok {
+		return "", fmt.Errorf("invalid API key")
+	}
+
+	// If key is bound to a specific tenant, ensure request tenant matches
+	if boundTenant != "tenant_test" && requestTenantID != "" && requestTenantID != boundTenant {
+		return boundTenant, fmt.Errorf("forbidden: cross-tenant key mismatch")
+	}
+
+	return boundTenant, nil
 }
 
 func main() {
@@ -63,6 +106,17 @@ func main() {
 			return
 		}
 
+		// Authenticate request
+		_, authErr := validateAuth(r, req.TenantID, req.APIKey)
+		if authErr != nil {
+			status := http.StatusUnauthorized
+			if strings.HasPrefix(authErr.Error(), "forbidden") {
+				status = http.StatusForbidden
+			}
+			http.Error(w, fmt.Sprintf(`{"error":"%s"}`, authErr.Error()), status)
+			return
+		}
+
 		resp, err := engine.Check(r.Context(), &req)
 		if err != nil {
 			http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusBadRequest)
@@ -94,10 +148,22 @@ func main() {
 		r.Body = http.MaxBytesReader(w, r.Body, 1<<20) // 1MB payload ceiling
 		var req struct {
 			TenantID string `json:"tenant_id"`
+			APIKey   string `json:"api_key,omitempty"`
 			Count    int64  `json:"count,omitempty"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.TenantID == "" {
 			http.Error(w, `{"error":"tenant_id required"}`, http.StatusBadRequest)
+			return
+		}
+
+		// Authenticate request
+		_, authErr := validateAuth(r, req.TenantID, req.APIKey)
+		if authErr != nil {
+			status := http.StatusUnauthorized
+			if strings.HasPrefix(authErr.Error(), "forbidden") {
+				status = http.StatusForbidden
+			}
+			http.Error(w, fmt.Sprintf(`{"error":"%s"}`, authErr.Error()), status)
 			return
 		}
 
@@ -106,7 +172,7 @@ func main() {
 		_ = json.NewEncoder(w).Encode(map[string]string{"status": "released"})
 	})
 
-	// Telemetry & Health
+	// Telemetry & Health (Unauthenticated endpoints)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{

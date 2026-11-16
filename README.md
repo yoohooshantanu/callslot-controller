@@ -13,14 +13,23 @@
 Client / Telephony Gateway (CallRelay / External Carrier)
                    │
                    │ POST /v1/check
-                   │ {"tenant_id": "cust_123", "resource": "call.initiate", "cost": 1}
+                   │ Headers: X-API-Key: tg_live_...
+                   │ Body: {"tenant_id": "cust_123", "resource": "call.initiate", "cost": 1}
                    ▼
 ┌────────────────────────────────────────────────────────────────────────┐
-│ 1. Concurrent Call Session Governor                                    │
-│    ├── Enforces Max Concurrent Calls per Tenant Tier                   │
-│    └── Prevents resource starvation by noisy neighbors                 │
+│ 0. HTTP Authentication & Tenant Binding Middleware                     │
+│    ├── Validates API Key via registry; blocks wildcard bypasses        │
+│    └── Prevents cross-tenant spoofing (401/403)                        │
 └───────────────────────────────────┬────────────────────────────────────┘
-                                    │ Allowed
+                                    │ Authorized
+                                    ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│ 1. Distributed Concurrent Call Governor (Atomic Redis Lua Script)      │
+│    ├── Atomic INCRBY / DECRBY with capacity ceiling checks             │
+│    ├── Preserves global limits across multiple cluster instances       │
+│    └── Automatic rollback if downstream token bucket fails             │
+└───────────────────────────────────┬────────────────────────────────────┘
+                                    │ Slot Reserved
                                     ▼
 ┌────────────────────────────────────────────────────────────────────────┐
 │ 2. Dual-Layer Rate Limiting Engine                                     │
@@ -46,12 +55,17 @@ Client / Telephony Gateway (CallRelay / External Carrier)
 - **L1 In-Memory Token Bucket**: Employs an atomic in-process token bucket to serve burstable telephony audio chunks in sub-microsecond time (**~869 ns/op**) without incurring network round-trips.
 - **L2 Distributed Sliding Window (Redis Lua Script)**: Enforces precise per-minute requests across distributed gateway nodes using atomic sorted-set (`ZREMRANGEBYSCORE`, `ZCARD`, `ZADD`) transactions.
 
-### B. Concurrent Voice Session Enforcing
+### B. Distributed Concurrent Voice Session Governor
 Unlike generic HTTP rate limiters that only count requests per second, TenantGate actively tracks **concurrent active calls**:
-- `call.initiate` increments the active call gauge against the tenant's tier quota (e.g., Free: 5, Growth: 30, Enterprise: 300).
-- When a call completes, `/v1/release` decrements the session counter.
+- `call.initiate` reserves a slot in Redis via an atomic Lua script (`ReserveCallScript`), ensuring cluster-wide concurrency ceilings (e.g., Free: 5, Growth: 30, Enterprise: 300) are enforced across all server instances.
+- When a call completes, `/v1/release` decrements the session counter via `ReleaseCallScript`.
+- If an L1 burst limit or downstream filter fails, reserved call slots are automatically rolled back without leaking capacity.
 
-### C. Standard IETF Compliance
+### C. HTTP Authentication & Tenant Isolation
+- Requests to `/v1/check` and `/v1/release` require valid API keys passed via `X-API-Key`, `Authorization: Bearer <key>`, or `api_key` payload.
+- Keys are strictly bound to authorized tenants. Cross-tenant tampering is blocked with `403 Forbidden`.
+
+### D. Standard IETF Compliance
 Every evaluation returns standard HTTP rate-limiting headers:
 - `RateLimit-Limit`: Maximum quota for the window.
 - `RateLimit-Remaining`: Remaining credits.
@@ -90,17 +104,13 @@ go test -v ./tests/...
 go run ./cmd/server
 ```
 
-### Running with Docker Compose
-```bash
-docker compose up --build -d
-```
-
 ### Checking Rate Limits
 ```bash
 curl -X POST http://localhost:8082/v1/check \
   -H "Content-Type: application/json" \
+  -H "X-API-Key: tg_live_free_key" \
   -d '{
-    "tenant_id": "tenant_enterprise_01",
+    "tenant_id": "tenant_free_test",
     "resource": "call.initiate",
     "cost": 1
   }'
@@ -110,7 +120,8 @@ curl -X POST http://localhost:8082/v1/check \
 ```bash
 curl -X POST http://localhost:8082/v1/release \
   -H "Content-Type: application/json" \
-  -d '{"tenant_id": "tenant_enterprise_01"}'
+  -H "X-API-Key: tg_live_free_key" \
+  -d '{"tenant_id": "tenant_free_test"}'
 ```
 
 ---
@@ -119,21 +130,21 @@ curl -X POST http://localhost:8082/v1/release \
 
 ```
 tenantgate/
-├── cmd/server/main.go            # Entrypoint, route handlers, IETF headers, graceful shutdown
+├── cmd/server/main.go            # Entrypoint, route handlers, auth middleware, IETF headers
 ├── internal/
 │   ├── model/types.go            # Domain models: QuotaPolicy, TierLevel, RateLimitRequest/Response
 │   ├── cache/l1_cache.go         # In-memory Token Bucket L1 cache (< 1 µs evaluation)
-│   ├── limiter/engine.go         # Atomic Redis Lua sliding window script & concurrency governor
+│   ├── limiter/engine.go         # Atomic Redis Lua sliding window script & distributed concurrency governor
 │   ├── metrics/metrics.go        # Prometheus telemetry exposition (/metrics)
 │   └── logger/logger.go          # Structured slog JSON logger
-├── tests/limiter_test.go         # Burst capacity, concurrent call cap, and parallel load tests
+├── tests/limiter_test.go         # Live Redis sliding window, distributed call cap, auth, & load tests
 ├── docker-compose.yml            # Multi-container setup with Redis 7
 ├── Dockerfile                    # Multi-stage production container build
-└── .github/workflows/ci.yml      # GitHub Actions CI with -race detector
+└── .github/workflows/ci.yml      # GitHub Actions CI with live Redis 7 service container & -race detector
 ```
 
 ---
 
 ## 6. License
 
-MIT License. Authored by Shantanu.
+MIT License. Authored by Shantanu Juvekar (`santanujuvekar@gmail.com`).

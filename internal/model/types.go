@@ -9,6 +9,7 @@ var (
 	ErrTenantNotFound = errors.New("tenant tier configuration not found")
 	ErrQuotaExceeded  = errors.New("rate limit quota exceeded")
 	ErrInvalidRequest = errors.New("invalid rate limit check request")
+	ErrRedisFailure   = errors.New("redis cluster unavailable: fail-closed quota policy")
 )
 
 type TierLevel string
@@ -28,13 +29,13 @@ type QuotaPolicy struct {
 	RefillRatePerSec   float64   `json:"refill_rate_per_sec"`
 }
 
-// RateLimitRequest is sent by gateways or internal gRPC services
+// RateLimitRequest is sent by gateways or internal services
 type RateLimitRequest struct {
-	TenantID    string `json:"tenant_id"`
-	APIKey      string `json:"api_key,omitempty"`
-	Resource    string `json:"resource"` // e.g., "call.initiate", "audio.chunk", "ai.completion"
-	Cost        int64  `json:"cost"`     // token or request weight (default 1)
-	ClientIP    string `json:"client_ip,omitempty"`
+	TenantID string `json:"tenant_id"`
+	APIKey   string `json:"api_key,omitempty"`
+	Resource string `json:"resource"` // e.g., "call.initiate", "audio.chunk", "ai.completion"
+	Cost     int64  `json:"cost"`     // token or request weight (default 1)
+	ClientIP string `json:"client_ip,omitempty"`
 }
 
 // RateLimitResponse is returned with standard IETF RateLimit headers
@@ -46,6 +47,14 @@ type RateLimitResponse struct {
 	ResetAfterSeconds  int64     `json:"reset_after_seconds"`
 	ActiveCalls        int64     `json:"active_calls"`
 	MaxConcurrentCalls int64     `json:"max_concurrent_calls"`
+	ReservationID      string    `json:"reservation_id,omitempty"`
 	ViolationReason    string    `json:"violation_reason,omitempty"`
 	CheckedAt          time.Time `json:"checked_at"`
+}
+
+// ReleaseRequest releases an active call reservation idempotently
+type ReleaseRequest struct {
+	TenantID      string `json:"tenant_id"`
+	ReservationID string `json:"reservation_id"`
+	APIKey        string `json:"api_key,omitempty"`
 }

@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -16,6 +15,7 @@ import (
 	"github.com/redis/go-redis/v9"
 	"github.com/yoohooshantanu/tenantgate/internal/limiter"
 	"github.com/yoohooshantanu/tenantgate/internal/model"
+	"github.com/yoohooshantanu/tenantgate/internal/server"
 )
 
 func TestTokenBucketBurstLimiting(t *testing.T) {
@@ -70,7 +70,7 @@ func TestTokenBucketBurstLimiting(t *testing.T) {
 	}
 }
 
-func TestConcurrentCallsCapEnforcement(t *testing.T) {
+func TestConcurrentCallsCapEnforcementWithReservationID(t *testing.T) {
 	engine := limiter.NewEngine(nil)
 
 	engine.SetTenantPolicy("tenant_call_cap", &model.QuotaPolicy{
@@ -83,6 +83,8 @@ func TestConcurrentCallsCapEnforcement(t *testing.T) {
 
 	ctx := context.Background()
 
+	var reservationIDs []string
+
 	// Initiate 3 calls
 	for i := 0; i < 3; i++ {
 		resp, err := engine.Check(ctx, &model.RateLimitRequest{
@@ -93,6 +95,10 @@ func TestConcurrentCallsCapEnforcement(t *testing.T) {
 		if err != nil || !resp.Allowed {
 			t.Fatalf("expected call initiation %d to be permitted, got: %+v", i+1, resp)
 		}
+		if resp.ReservationID == "" {
+			t.Fatalf("expected non-empty reservation ID for call %d", i+1)
+		}
+		reservationIDs = append(reservationIDs, resp.ReservationID)
 	}
 
 	// 4th call should hit the max concurrent calls barrier
@@ -108,10 +114,37 @@ func TestConcurrentCallsCapEnforcement(t *testing.T) {
 		t.Fatalf("expected 4th concurrent call to be rejected")
 	}
 
-	// Release 1 call
-	engine.ReleaseCall("tenant_call_cap")
+	// Attempt release with non-existent/fake reservation ID -> must fail and NOT decrement
+	fakeReleased := engine.ReleaseCall("tenant_call_cap", "res_invalid_fake_id")
+	if fakeReleased {
+		t.Fatalf("expected release with invalid reservation ID to return false")
+	}
 
-	// Retry initiation, should now succeed
+	// Active calls must still be 3
+	active, _ := engine.GetActiveCalls(ctx, "tenant_call_cap")
+	if active != 3 {
+		t.Fatalf("active calls should remain 3 after fake release, got %d", active)
+	}
+
+	// Release 1 valid call using exact Reservation ID
+	validReleased := engine.ReleaseCall("tenant_call_cap", reservationIDs[0])
+	if !validReleased {
+		t.Fatalf("expected release of valid reservation ID to return true")
+	}
+
+	// Duplicate release of same reservation ID -> idempotent, must return false
+	dupReleased := engine.ReleaseCall("tenant_call_cap", reservationIDs[0])
+	if dupReleased {
+		t.Fatalf("duplicate release of same reservation ID must return false")
+	}
+
+	// Active calls must now be 2
+	active, _ = engine.GetActiveCalls(ctx, "tenant_call_cap")
+	if active != 2 {
+		t.Fatalf("active calls should be 2, got %d", active)
+	}
+
+	// Retry initiation, should now succeed and return a new reservation ID
 	retryResp, err := engine.Check(ctx, &model.RateLimitRequest{
 		TenantID: "tenant_call_cap",
 		Resource: "call.initiate",
@@ -119,6 +152,9 @@ func TestConcurrentCallsCapEnforcement(t *testing.T) {
 	})
 	if err != nil || !retryResp.Allowed {
 		t.Fatalf("expected call to succeed after releasing concurrency slot: %+v", retryResp)
+	}
+	if retryResp.ReservationID == "" {
+		t.Fatalf("expected valid new reservation ID on retry initiation")
 	}
 }
 
@@ -160,58 +196,18 @@ func TestActiveCallsRollbackOnL1Depletion(t *testing.T) {
 		t.Fatalf("second call should be rejected due to depleted burst bucket")
 	}
 
-	// Crucial assertion: Release the 1 successful call
-	engine.ReleaseCall("tenant_leak_test")
-}
-
-func TestBatchCallAllocationAndRelease(t *testing.T) {
-	engine := limiter.NewEngine(nil)
-	defer engine.Close()
-
-	engine.SetTenantPolicy("tenant_batch_test", &model.QuotaPolicy{
-		Tier:               model.TierGrowth,
-		RequestsPerMinute:  600,
-		MaxConcurrentCalls: 10,
-		BurstCapacity:      50,
-		RefillRatePerSec:   10.0,
-	})
-
-	ctx := context.Background()
-
-	// Reserve batch of 6 concurrent calls
-	resp, err := engine.Check(ctx, &model.RateLimitRequest{
-		TenantID: "tenant_batch_test",
-		Resource: "call.initiate",
-		Cost:     6,
-	})
-	if err != nil || !resp.Allowed {
-		t.Fatalf("expected batch call of 6 to succeed: %+v, err: %v", resp, err)
+	// Active calls must still be 1 (second call rolled back cleanly)
+	active, _ := engine.GetActiveCalls(ctx, "tenant_leak_test")
+	if active != 1 {
+		t.Fatalf("expected 1 active call after rollback, got %d", active)
 	}
 
-	// 5 more should fail because max is 10 (6 + 5 = 11 > 10)
-	resp2, err := engine.Check(ctx, &model.RateLimitRequest{
-		TenantID: "tenant_batch_test",
-		Resource: "call.initiate",
-		Cost:     5,
-	})
-	if err != nil {
-		t.Fatalf("unexpected err: %v", err)
-	}
-	if resp2.Allowed {
-		t.Fatalf("expected batch of 5 to exceed capacity (11 > 10)")
-	}
+	// Release the 1 successful call
+	engine.ReleaseCall("tenant_leak_test", resp1.ReservationID)
 
-	// Release 4 slots out of the 6
-	engine.ReleaseCall("tenant_batch_test", 4)
-
-	// Now 5 more should succeed (active was 6 - 4 = 2, 2 + 5 = 7 <= 10)
-	resp3, err := engine.Check(ctx, &model.RateLimitRequest{
-		TenantID: "tenant_batch_test",
-		Resource: "call.initiate",
-		Cost:     5,
-	})
-	if err != nil || !resp3.Allowed {
-		t.Fatalf("expected batch of 5 to succeed after partial release: %+v", resp3)
+	active, _ = engine.GetActiveCalls(ctx, "tenant_leak_test")
+	if active != 0 {
+		t.Fatalf("expected 0 active calls after release, got %d", active)
 	}
 }
 
@@ -303,7 +299,7 @@ func TestLiveRedisSlidingWindowLimiting(t *testing.T) {
 	}
 }
 
-func TestLiveRedisDistributedConcurrentCallCap(t *testing.T) {
+func TestLiveRedisDistributedReservationIDCallCap(t *testing.T) {
 	redisAddr := os.Getenv("REDIS_ADDR")
 	if redisAddr == "" {
 		t.Skip("Skipping live Redis distributed call cap test: REDIS_ADDR not set")
@@ -328,130 +324,186 @@ func TestLiveRedisDistributedConcurrentCallCap(t *testing.T) {
 	policy := &model.QuotaPolicy{
 		Tier:               model.TierFree,
 		RequestsPerMinute:  1000,
-		MaxConcurrentCalls: 3, // Global limit across all instances
+		MaxConcurrentCalls: 2, // Global limit across all cluster instances
 		BurstCapacity:      100,
 		RefillRatePerSec:   100.0,
 	}
 	engineInstanceA.SetTenantPolicy(tenantID, policy)
 	engineInstanceB.SetTenantPolicy(tenantID, policy)
 
-	// Instance A reserves 2 concurrent call slots
+	// Instance A reserves call 1
 	resp1, err := engineInstanceA.Check(ctx, &model.RateLimitRequest{
-		TenantID: tenantID,
-		Resource: "call.initiate",
-		Cost:     2,
-	})
-	if err != nil || !resp1.Allowed {
-		t.Fatalf("Instance A failed reserving 2 call slots: %+v, err: %v", resp1, err)
-	}
-
-	// Instance B attempts to reserve 2 concurrent call slots (2 + 2 = 4 > 3 -> Must fail!)
-	resp2, err := engineInstanceB.Check(ctx, &model.RateLimitRequest{
-		TenantID: tenantID,
-		Resource: "call.initiate",
-		Cost:     2,
-	})
-	if err != nil {
-		t.Fatalf("Instance B check returned unexpected err: %v", err)
-	}
-	if resp2.Allowed {
-		t.Fatalf("Instance B should have been rejected by distributed Redis concurrency cap (4 > 3)")
-	}
-
-	// Instance A releases 1 slot
-	engineInstanceA.ReleaseCall(tenantID, 1)
-
-	// Instance B now reserves 1 slot (2 - 1 + 1 = 2 <= 3 -> Must succeed!)
-	resp3, err := engineInstanceB.Check(ctx, &model.RateLimitRequest{
 		TenantID: tenantID,
 		Resource: "call.initiate",
 		Cost:     1,
 	})
-	if err != nil || !resp3.Allowed {
-		t.Fatalf("Instance B should succeed reserving 1 slot after Instance A released: %+v, err: %v", resp3, err)
+	if err != nil || !resp1.Allowed || resp1.ReservationID == "" {
+		t.Fatalf("Instance A failed reserving call 1: %+v, err: %v", resp1, err)
+	}
+
+	// Instance B reserves call 2
+	resp2, err := engineInstanceB.Check(ctx, &model.RateLimitRequest{
+		TenantID: tenantID,
+		Resource: "call.initiate",
+		Cost:     1,
+	})
+	if err != nil || !resp2.Allowed || resp2.ReservationID == "" {
+		t.Fatalf("Instance B failed reserving call 2: %+v, err: %v", resp2, err)
+	}
+
+	// Instance A attempts call 3 (1 + 1 + 1 = 3 > 2 -> Must be rejected!)
+	resp3, err := engineInstanceA.Check(ctx, &model.RateLimitRequest{
+		TenantID: tenantID,
+		Resource: "call.initiate",
+		Cost:     1,
+	})
+	if err != nil {
+		t.Fatalf("Instance A check returned error: %v", err)
+	}
+	if resp3.Allowed {
+		t.Fatalf("expected call 3 to be rejected by global Redis concurrency ceiling (3 > 2)")
+	}
+
+	// Instance A releases call 1 using exact reservation ID
+	released := engineInstanceA.ReleaseCall(tenantID, resp1.ReservationID)
+	if !released {
+		t.Fatalf("expected successful release of call 1 in Redis")
+	}
+
+	// Now Instance A attempts call 3 again (Active is 1, 1 + 1 = 2 <= 2 -> Must succeed!)
+	resp4, err := engineInstanceA.Check(ctx, &model.RateLimitRequest{
+		TenantID: tenantID,
+		Resource: "call.initiate",
+		Cost:     1,
+	})
+	if err != nil || !resp4.Allowed || resp4.ReservationID == "" {
+		t.Fatalf("expected call 3 to succeed after call 1 released: %+v, err: %v", resp4, err)
 	}
 }
 
-func TestHTTPAuthenticationValidation(t *testing.T) {
-	// Setup test handler mimicking server/main.go auth
-	keyRegistry := map[string]string{
+func TestFailClosedRedisPolicy(t *testing.T) {
+	// Connect to a deliberately non-existent Redis port to test fail-closed semantics
+	deadRdb := redis.NewClient(&redis.Options{
+		Addr:        "127.0.0.1:54321", // dead port
+		DialTimeout: 50 * time.Millisecond,
+	})
+	defer deadRdb.Close()
+
+	engine := limiter.NewEngine(deadRdb)
+	defer engine.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	// Check on dead Redis must FAIL CLOSED and return an error
+	resp, err := engine.Check(ctx, &model.RateLimitRequest{
+		TenantID: "tenant_fail_closed_test",
+		Resource: "call.initiate",
+		Cost:     1,
+	})
+	if err == nil {
+		t.Fatalf("expected error from fail-closed Redis policy when Redis is unreachable")
+	}
+	if resp != nil && resp.Allowed {
+		t.Fatalf("fail-closed policy must NOT allow requests when Redis is unavailable")
+	}
+}
+
+func TestProductionRegistryStartsEmpty(t *testing.T) {
+	// Verify that server.LoadProductionKeyRegistry() starts completely empty
+	reg := server.LoadProductionKeyRegistry()
+
+	hardcodedKeys := []string{
+		"tg_test_key_123",
+		"tg_live_free_key",
+		"tg_live_growth_key",
+	}
+
+	for _, k := range hardcodedKeys {
+		if tenant, found := reg[k]; found {
+			t.Fatalf("production registry must not contain hardcoded default credential %q (mapped to %q)", k, tenant)
+		}
+	}
+}
+
+func TestHTTPProductionRouterStrictAuthentication(t *testing.T) {
+	engine := limiter.NewEngine(nil)
+	defer engine.Close()
+
+	engine.SetTenantPolicy("tenant_free_test", &model.QuotaPolicy{
+		Tier:               model.TierFree,
+		RequestsPerMinute:  60,
+		MaxConcurrentCalls: 5,
+		BurstCapacity:      10,
+		RefillRatePerSec:   1.0,
+	})
+
+	testKeyRegistry := map[string]string{
 		"tg_test_key_123":    "tenant_test",
 		"tg_live_free_key":   "tenant_free_test",
 		"tg_live_growth_key": "tenant_call_cap",
 	}
 
-	validateAuth := func(r *http.Request, requestTenantID, bodyAPIKey string) (string, error) {
-		key := r.Header.Get("X-API-Key")
-		if key == "" {
-			authHdr := r.Header.Get("Authorization")
-			if strings.HasPrefix(authHdr, "Bearer ") {
-				key = strings.TrimPrefix(authHdr, "Bearer ")
-			}
-		}
-		if key == "" {
-			key = bodyAPIKey
-		}
-		if key == "" {
-			return "", fmt.Errorf("missing API key")
-		}
-		boundTenant, ok := keyRegistry[key]
-		if !ok {
-			return "", fmt.Errorf("invalid API key")
-		}
-		if boundTenant != "tenant_test" && requestTenantID != "" && requestTenantID != boundTenant {
-			return boundTenant, fmt.Errorf("forbidden: cross-tenant key mismatch")
-		}
-		return boundTenant, nil
-	}
-
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var req model.RateLimitRequest
-		_ = json.NewDecoder(r.Body).Decode(&req)
-		_, err := validateAuth(r, req.TenantID, req.APIKey)
-		if err != nil {
-			if strings.HasPrefix(err.Error(), "forbidden") {
-				http.Error(w, err.Error(), http.StatusForbidden)
-			} else {
-				http.Error(w, err.Error(), http.StatusUnauthorized)
-			}
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"status":"ok"}`))
-	})
+	// Directly exercise the actual production router
+	mux := server.SetupRouter(engine, testKeyRegistry)
 
 	// 1. Missing Auth -> 401
-	req1 := httptest.NewRequest(http.MethodPost, "/v1/check", bytes.NewBufferString(`{"tenant_id":"tenant_free_test"}`))
+	req1 := httptest.NewRequest(http.MethodPost, "/v1/check", bytes.NewBufferString(`{"tenant_id":"tenant_free_test","resource":"audio.chunk"}`))
 	w1 := httptest.NewRecorder()
-	handler.ServeHTTP(w1, req1)
+	mux.ServeHTTP(w1, req1)
 	if w1.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401 for missing auth, got: %d", w1.Code)
 	}
 
 	// 2. Invalid Key -> 401
-	req2 := httptest.NewRequest(http.MethodPost, "/v1/check", bytes.NewBufferString(`{"tenant_id":"tenant_free_test"}`))
+	req2 := httptest.NewRequest(http.MethodPost, "/v1/check", bytes.NewBufferString(`{"tenant_id":"tenant_free_test","resource":"audio.chunk"}`))
 	req2.Header.Set("X-API-Key", "invalid_random_key")
 	w2 := httptest.NewRecorder()
-	handler.ServeHTTP(w2, req2)
+	mux.ServeHTTP(w2, req2)
 	if w2.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401 for invalid key, got: %d", w2.Code)
 	}
 
-	// 3. Cross-tenant mismatch (using growth key for free tenant) -> 403
-	req3 := httptest.NewRequest(http.MethodPost, "/v1/check", bytes.NewBufferString(`{"tenant_id":"tenant_free_test"}`))
-	req3.Header.Set("X-API-Key", "tg_live_growth_key")
+	// 3. Proves test-key bypass is eliminated: tg_test_key_123 cannot request tenant_free_test -> 403 Forbidden!
+	req3 := httptest.NewRequest(http.MethodPost, "/v1/check", bytes.NewBufferString(`{"tenant_id":"tenant_free_test","resource":"audio.chunk"}`))
+	req3.Header.Set("X-API-Key", "tg_test_key_123")
 	w3 := httptest.NewRecorder()
-	handler.ServeHTTP(w3, req3)
+	mux.ServeHTTP(w3, req3)
 	if w3.Code != http.StatusForbidden {
-		t.Fatalf("expected 403 for cross-tenant key mismatch, got: %d", w3.Code)
+		t.Fatalf("expected 403 Forbidden when tg_test_key_123 requests tenant_free_test, got: %d", w3.Code)
 	}
 
-	// 4. Valid auth matching tenant -> 200
-	req4 := httptest.NewRequest(http.MethodPost, "/v1/check", bytes.NewBufferString(`{"tenant_id":"tenant_free_test"}`))
-	req4.Header.Set("X-API-Key", "tg_live_free_key")
+	// 4. Cross-tenant mismatch (growth key for free tenant) -> 403 Forbidden
+	req4 := httptest.NewRequest(http.MethodPost, "/v1/check", bytes.NewBufferString(`{"tenant_id":"tenant_free_test","resource":"audio.chunk"}`))
+	req4.Header.Set("X-API-Key", "tg_live_growth_key")
 	w4 := httptest.NewRecorder()
-	handler.ServeHTTP(w4, req4)
-	if w4.Code != http.StatusOK {
-		t.Fatalf("expected 200 for valid auth, got: %d", w4.Code)
+	mux.ServeHTTP(w4, req4)
+	if w4.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for cross-tenant key mismatch, got: %d", w4.Code)
+	}
+
+	// 5. Valid auth matching tenant -> 200 OK with Reservation ID on call.initiate
+	req5 := httptest.NewRequest(http.MethodPost, "/v1/check", bytes.NewBufferString(`{"tenant_id":"tenant_free_test","resource":"call.initiate"}`))
+	req5.Header.Set("X-API-Key", "tg_live_free_key")
+	w5 := httptest.NewRecorder()
+	mux.ServeHTTP(w5, req5)
+	if w5.Code != http.StatusOK {
+		t.Fatalf("expected 200 for valid auth, got: %d, body: %s", w5.Code, w5.Body.String())
+	}
+
+	var checkResp model.RateLimitResponse
+	_ = json.NewDecoder(w5.Body).Decode(&checkResp)
+	if checkResp.ReservationID == "" {
+		t.Fatalf("expected non-empty reservation ID in response")
+	}
+
+	// 6. Release endpoint with valid reservation ID -> 200 OK
+	relPayload := fmt.Sprintf(`{"tenant_id":"tenant_free_test","reservation_id":"%s"}`, checkResp.ReservationID)
+	req6 := httptest.NewRequest(http.MethodPost, "/v1/release", bytes.NewBufferString(relPayload))
+	req6.Header.Set("X-API-Key", "tg_live_free_key")
+	w6 := httptest.NewRecorder()
+	mux.ServeHTTP(w6, req6)
+	if w6.Code != http.StatusOK {
+		t.Fatalf("expected 200 on release, got: %d, body: %s", w6.Code, w6.Body.String())
 	}
 }

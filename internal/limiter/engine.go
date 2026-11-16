@@ -16,6 +16,9 @@ import (
 	"github.com/yoohooshantanu/tenantgate/internal/model"
 )
 
+// DefaultReservationTTL defines the maximum safety ceiling before an abandoned reservation is purged (4 hours)
+const DefaultReservationTTL = 14400 // 4 hours in seconds
+
 // SlidingWindowScript is an atomic Redis Lua script enforcing sliding window rate limits
 const SlidingWindowScript = `
 local key = KEYS[1]
@@ -44,17 +47,24 @@ else
 end
 `
 
-// ReserveCallScript atomically checks capacity and registers an exact Reservation ID in Redis
+// ReserveCallScript atomically cleans up expired individual reservations and reserves an exact Reservation ID
+// Uses a Redis Sorted Set (ZSET) where score = per-reservation expiration timestamp.
+// This guarantees that no blanket key expiration can ever wipe out or reset active calls!
 const ReserveCallScript = `
-local res_key = KEYS[1]
+local key = KEYS[1]
 local res_id = ARGV[1]
 local max_cap = tonumber(ARGV[2])
 local now = tonumber(ARGV[3])
+local ttl = tonumber(ARGV[4])
 
-local current = redis.call('HLEN', res_key)
+-- Clean up only expired individual reservations whose expiry timestamp has passed
+redis.call('ZREMRANGEBYSCORE', key, '-inf', now)
+
+-- Count current active reservations
+local current = redis.call('ZCARD', key)
 if current < max_cap then
-    redis.call('HSET', res_key, res_id, now)
-    redis.call('EXPIRE', res_key, 7200)
+    -- Record individual reservation with its own exact expiry timestamp
+    redis.call('ZADD', key, now + ttl, res_id)
     return {1, current + 1}
 else
     return {0, current}
@@ -63,11 +73,11 @@ end
 
 // ReleaseCallScript atomically removes an exact Reservation ID without affecting unrelated calls
 const ReleaseCallScript = `
-local res_key = KEYS[1]
+local key = KEYS[1]
 local res_id = ARGV[1]
 
-local deleted = redis.call('HDEL', res_key, res_id)
-local remaining = redis.call('HLEN', res_key)
+local deleted = redis.call('ZREM', key, res_id)
+local remaining = redis.call('ZCARD', key)
 return {deleted, remaining}
 `
 
@@ -194,13 +204,13 @@ func (e *Engine) Check(ctx context.Context, req *model.RateLimitRequest) (*model
 		resID := generateReservationID(req.TenantID)
 
 		if e.rdb != nil {
-			// Distributed Atomic Concurrency Reservation in Redis via HSET
+			// Distributed Atomic Concurrency Reservation in Redis via Sorted Set
 			callKey := fmt.Sprintf("cc:res:%s", req.TenantID)
-			nowMs := time.Now().UnixMilli()
+			nowSec := time.Now().Unix()
 
-			res, err := e.evalScript(ctx, e.reserveCallSHA, ReserveCallScript, []string{callKey}, resID, policy.MaxConcurrentCalls, nowMs)
+			res, err := e.evalScript(ctx, e.reserveCallSHA, ReserveCallScript, []string{callKey}, resID, policy.MaxConcurrentCalls, nowSec, DefaultReservationTTL)
 			if err != nil {
-				// FAIL-CLOSED: Redis cluster failure must not bypass global quota limits
+				// FAIL-CLOSED: Redis failure must reject requests rather than bypassing limits
 				metrics.DefaultMetrics.IncCheck(false, true)
 				return &model.RateLimitResponse{
 					Allowed:         false,
@@ -227,13 +237,22 @@ func (e *Engine) Check(ctx context.Context, req *model.RateLimitRequest) (*model
 				metrics.DefaultMetrics.UpdateActiveCalls(1)
 			}
 		} else {
-			// In-memory fallback concurrency cap with reservation ID tracking
+			// In-memory fallback concurrency cap with individual per-reservation expiration
 			e.activeResMu.Lock()
 			resMap, ok := e.activeReservations[req.TenantID]
 			if !ok {
 				resMap = make(map[string]time.Time)
 				e.activeReservations[req.TenantID] = resMap
 			}
+
+			// Prune expired individual reservations
+			now := time.Now()
+			for rID, exp := range resMap {
+				if now.After(exp) {
+					delete(resMap, rID)
+				}
+			}
+
 			current := int64(len(resMap))
 			if current+1 > policy.MaxConcurrentCalls {
 				e.activeResMu.Unlock()
@@ -247,7 +266,7 @@ func (e *Engine) Check(ctx context.Context, req *model.RateLimitRequest) (*model
 					CheckedAt:          time.Now().UTC(),
 				}, nil
 			}
-			resMap[resID] = time.Now()
+			resMap[resID] = now.Add(time.Duration(DefaultReservationTTL) * time.Second)
 			e.activeResMu.Unlock()
 			metrics.DefaultMetrics.UpdateActiveCalls(1)
 			reservedID = resID
@@ -380,18 +399,28 @@ func (e *Engine) ReleaseCall(tenantID, reservationID string) bool {
 	return released
 }
 
-// GetActiveCalls returns current concurrent calls for a tenant
+// GetActiveCalls returns current concurrent calls for a tenant (excluding expired ones)
 func (e *Engine) GetActiveCalls(ctx context.Context, tenantID string) (int64, error) {
 	if e.rdb != nil {
 		callKey := fmt.Sprintf("cc:res:%s", tenantID)
-		val, err := e.rdb.HLen(ctx, callKey).Result()
+		// Prune expired before counting
+		nowSec := time.Now().Unix()
+		_ = e.rdb.ZRemRangeByScore(ctx, callKey, "-inf", fmt.Sprintf("%d", nowSec)).Err()
+		val, err := e.rdb.ZCard(ctx, callKey).Result()
 		return val, err
 	}
 
 	e.activeResMu.RLock()
 	defer e.activeResMu.RUnlock()
 	if resMap, ok := e.activeReservations[tenantID]; ok {
-		return int64(len(resMap)), nil
+		now := time.Now()
+		var count int64
+		for _, exp := range resMap {
+			if !now.After(exp) {
+				count++
+			}
+		}
+		return count, nil
 	}
 	return 0, nil
 }

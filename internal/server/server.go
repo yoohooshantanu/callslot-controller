@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -10,10 +11,29 @@ import (
 	"strings"
 	"time"
 
+	"github.com/redis/go-redis/v9"
 	"github.com/yoohooshantanu/tenantgate/internal/limiter"
 	"github.com/yoohooshantanu/tenantgate/internal/metrics"
 	"github.com/yoohooshantanu/tenantgate/internal/model"
 )
+
+// InitRedis creates and validates a Redis client connection.
+// If redisAddr is configured, failing the initial ping returns an error to enforce fail-closed startup.
+func InitRedis(redisAddr string) (*redis.Client, error) {
+	if redisAddr == "" {
+		return nil, nil // Intentional standalone in-memory mode
+	}
+
+	rdb := redis.NewClient(&redis.Options{Addr: redisAddr})
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	if err := rdb.Ping(ctx).Err(); err != nil {
+		return nil, fmt.Errorf("redis startup ping failed for %s: %w", redisAddr, err)
+	}
+
+	return rdb, nil
+}
 
 // LoadProductionKeyRegistry initializes key registry strictly from environment configuration
 func LoadProductionKeyRegistry() map[string]string {

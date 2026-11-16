@@ -8,7 +8,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/redis/go-redis/v9"
 	"github.com/yoohooshantanu/tenantgate/internal/limiter"
 	"github.com/yoohooshantanu/tenantgate/internal/logger"
 	"github.com/yoohooshantanu/tenantgate/internal/server"
@@ -27,17 +26,18 @@ func main() {
 
 	logger.L.Info("starting_tenantgate", "port", port)
 
-	var rdb *redis.Client
-	if redisAddr != "" {
-		rdb = redis.NewClient(&redis.Options{Addr: redisAddr})
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		if err := rdb.Ping(ctx).Err(); err != nil {
-			logger.L.Warn("redis_ping_failed_falling_back_to_l1", "error", err)
-			rdb = nil
-		} else {
-			logger.L.Info("redis_connected", "addr", redisAddr)
-		}
-		cancel()
+	// Strict fail-closed startup validation:
+	// If REDIS_ADDR is configured, failing the initial ping halts startup rather than silently falling back
+	rdb, err := server.InitRedis(redisAddr)
+	if err != nil {
+		logger.L.Error("fatal_redis_startup_error_fail_closed", "error", err)
+		os.Exit(1)
+	}
+
+	if rdb != nil {
+		logger.L.Info("redis_connected", "addr", redisAddr)
+	} else {
+		logger.L.Info("running_in_standalone_inmemory_mode")
 	}
 
 	engine := limiter.NewEngine(rdb)

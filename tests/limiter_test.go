@@ -507,3 +507,93 @@ func TestHTTPProductionRouterStrictAuthentication(t *testing.T) {
 		t.Fatalf("expected 200 on release, got: %d, body: %s", w6.Code, w6.Body.String())
 	}
 }
+
+func TestFailClosedRedisStartup(t *testing.T) {
+	// If REDIS_ADDR is configured but unreachable, InitRedis MUST return an error rather than silently falling back
+	_, err := server.InitRedis("127.0.0.1:54321") // dead port
+	if err == nil {
+		t.Fatalf("expected InitRedis to fail closed with error when Redis is unreachable")
+	}
+
+	// If REDIS_ADDR is empty, standalone in-memory mode is accepted
+	client, err := server.InitRedis("")
+	if err != nil || client != nil {
+		t.Fatalf("expected nil client and nil error for empty redisAddr")
+	}
+}
+
+func TestPerReservationExpiryNoReset(t *testing.T) {
+	redisAddr := os.Getenv("REDIS_ADDR")
+	if redisAddr == "" {
+		t.Skip("Skipping live Redis per-reservation test: REDIS_ADDR not set")
+	}
+
+	rdb := redis.NewClient(&redis.Options{Addr: redisAddr})
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	if err := rdb.Ping(ctx).Err(); err != nil {
+		t.Skipf("Skipping live Redis test: cannot ping Redis at %s: %v", redisAddr, err)
+	}
+
+	engine := limiter.NewEngine(rdb)
+	defer engine.Close()
+
+	tenantID := fmt.Sprintf("tenant_per_res_%d", time.Now().UnixNano())
+	callKey := fmt.Sprintf("cc:res:%s", tenantID)
+
+	engine.SetTenantPolicy(tenantID, &model.QuotaPolicy{
+		Tier:               model.TierFree,
+		RequestsPerMinute:  1000,
+		MaxConcurrentCalls: 3,
+		BurstCapacity:      100,
+		RefillRatePerSec:   100.0,
+	})
+
+	// 1. Reserve Active Call 1
+	resp1, err := engine.Check(ctx, &model.RateLimitRequest{
+		TenantID: tenantID,
+		Resource: "call.initiate",
+		Cost:     1,
+	})
+	if err != nil || !resp1.Allowed || resp1.ReservationID == "" {
+		t.Fatalf("failed reserving Call 1: %+v, err: %v", resp1, err)
+	}
+
+	// 2. Inject an already-expired reservation into the ZSET (score in past)
+	pastSec := float64(time.Now().Unix() - 100)
+	err = rdb.ZAdd(ctx, callKey, redis.Z{Score: pastSec, Member: "res_abandoned_past_id"}).Err()
+	if err != nil {
+		t.Fatalf("failed injecting past reservation: %v", err)
+	}
+
+	// 3. Reserve Active Call 2: Engine must purge the expired past reservation while keeping Call 1 intact!
+	resp2, err := engine.Check(ctx, &model.RateLimitRequest{
+		TenantID: tenantID,
+		Resource: "call.initiate",
+		Cost:     1,
+	})
+	if err != nil || !resp2.Allowed || resp2.ReservationID == "" {
+		t.Fatalf("failed reserving Call 2: %+v, err: %v", resp2, err)
+	}
+
+	// 4. Verify Call 1 is STILL valid in Redis and active calls count is 2 (Call 1 + Call 2)
+	active, err := engine.GetActiveCalls(ctx, tenantID)
+	if err != nil {
+		t.Fatalf("GetActiveCalls failed: %v", err)
+	}
+	if active != 2 {
+		t.Fatalf("expected exactly 2 active calls (expired reservation pruned, Call 1 preserved), got: %d", active)
+	}
+
+	// 5. Ensure Call 1 can be successfully released by its Reservation ID
+	released := engine.ReleaseCall(tenantID, resp1.ReservationID)
+	if !released {
+		t.Fatalf("expected successful release of Call 1, proving it was not wiped out by expiry")
+	}
+
+	active, _ = engine.GetActiveCalls(ctx, tenantID)
+	if active != 1 {
+		t.Fatalf("expected 1 active call remaining after Call 1 released, got: %d", active)
+	}
+}

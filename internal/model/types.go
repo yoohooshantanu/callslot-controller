@@ -58,3 +58,19 @@ type ReleaseRequest struct {
 	ReservationID string `json:"reservation_id"`
 	APIKey        string `json:"api_key,omitempty"`
 }
+
+// RenewRequest extends the lease of an active call reservation
+type RenewRequest struct {
+	TenantID      string `json:"tenant_id"`
+	ReservationID string `json:"reservation_id"`
+	TTLSeconds    int64  `json:"ttl_seconds,omitempty"`
+	APIKey        string `json:"api_key,omitempty"`
+}
+
+// RenewResponse returns the result of the reservation lease renewal
+type RenewResponse struct {
+	TenantID      string `json:"tenant_id"`
+	ReservationID string `json:"reservation_id"`
+	Renewed       bool   `json:"renewed"`
+	TTLSeconds    int64  `json:"ttl_seconds"`
+}

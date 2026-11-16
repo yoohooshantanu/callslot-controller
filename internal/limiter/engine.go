@@ -81,6 +81,28 @@ local remaining = redis.call('ZCARD', key)
 return {deleted, remaining}
 `
 
+// RenewCallScript atomically extends the lease of an existing active Reservation ID.
+// Uses ZADD with XX to guarantee elements are only updated if they already exist, never inserted.
+const RenewCallScript = `
+local key = KEYS[1]
+local res_id = ARGV[1]
+local now = tonumber(ARGV[2])
+local ttl = tonumber(ARGV[3])
+
+-- Clean up expired individual reservations
+redis.call('ZREMRANGEBYSCORE', key, '-inf', now)
+
+-- Check if reservation exists and is active
+local score = redis.call('ZSCORE', key, res_id)
+if score then
+    -- Extend lease with new expiry timestamp (now + ttl)
+    redis.call('ZADD', key, 'XX', now + ttl, res_id)
+    return 1
+else
+    return 0
+end
+`
+
 // Engine orchestrates multi-tiered distributed rate limiting & concurrent call caps
 type Engine struct {
 	l1Cache            *cache.L1LocalCache
@@ -88,6 +110,7 @@ type Engine struct {
 	slidingSHA         string
 	reserveCallSHA     string
 	releaseCallSHA     string
+	renewCallSHA       string
 	policiesMu         sync.RWMutex
 	policies           map[string]*model.QuotaPolicy
 	activeResMu        sync.RWMutex
@@ -115,6 +138,9 @@ func NewEngine(rdb *redis.Client) *Engine {
 		}
 		if sha, err := rdb.ScriptLoad(ctx, ReleaseCallScript).Result(); err == nil {
 			e.releaseCallSHA = sha
+		}
+		if sha, err := rdb.ScriptLoad(ctx, RenewCallScript).Result(); err == nil {
+			e.renewCallSHA = sha
 		}
 	}
 
@@ -397,6 +423,48 @@ func (e *Engine) ReleaseCall(tenantID, reservationID string) bool {
 	}
 
 	return released
+}
+
+// RenewReservation extends the lease of an active concurrent call reservation.
+// Returns true if renewed, false if reservation is missing or already expired.
+func (e *Engine) RenewReservation(tenantID, reservationID string, ttlSec ...int64) bool {
+	if tenantID == "" || reservationID == "" {
+		return false
+	}
+
+	ttl := int64(DefaultReservationTTL)
+	if len(ttlSec) > 0 && ttlSec[0] > 0 {
+		ttl = ttlSec[0]
+	}
+
+	if e.rdb != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		callKey := fmt.Sprintf("cc:res:%s", tenantID)
+		nowSec := time.Now().Unix()
+		res, err := e.evalScript(ctx, e.renewCallSHA, RenewCallScript, []string{callKey}, reservationID, nowSec, ttl)
+		if err == nil {
+			if updated, ok := res.(int64); ok && updated == 1 {
+				return true
+			}
+		}
+		return false
+	}
+
+	// In-memory fallback
+	e.activeResMu.Lock()
+	defer e.activeResMu.Unlock()
+	if resMap, ok := e.activeReservations[tenantID]; ok {
+		if exp, exists := resMap[reservationID]; exists {
+			now := time.Now()
+			if !now.After(exp) {
+				resMap[reservationID] = now.Add(time.Duration(ttl) * time.Second)
+				return true
+			}
+			delete(resMap, reservationID)
+		}
+	}
+	return false
 }
 
 // GetActiveCalls returns current concurrent calls for a tenant (excluding expired ones)

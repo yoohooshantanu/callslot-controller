@@ -171,6 +171,63 @@ func SetupRouter(engine *limiter.Engine, keyRegistry map[string]string) *http.Se
 		})
 	})
 
+	// Renew concurrent call session lease: /v1/renew
+	mux.HandleFunc("/v1/renew", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+			return
+		}
+
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20) // 1MB payload ceiling
+		var req model.RenewRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.TenantID == "" {
+			http.Error(w, `{"error":"tenant_id required"}`, http.StatusBadRequest)
+			return
+		}
+
+		if req.ReservationID == "" {
+			http.Error(w, `{"error":"reservation_id required for renewal"}`, http.StatusBadRequest)
+			return
+		}
+
+		// Authenticate request
+		_, authErr := ValidateAuth(r, keyRegistry, req.TenantID, req.APIKey)
+		if authErr != nil {
+			statusCode := http.StatusUnauthorized
+			if strings.HasPrefix(authErr.Error(), "forbidden") {
+				statusCode = http.StatusForbidden
+			}
+			http.Error(w, fmt.Sprintf(`{"error":"%s"}`, authErr.Error()), statusCode)
+			return
+		}
+
+		ttl := req.TTLSeconds
+		if ttl <= 0 {
+			ttl = limiter.DefaultReservationTTL
+		}
+
+		renewed := engine.RenewReservation(req.TenantID, req.ReservationID, ttl)
+		w.Header().Set("Content-Type", "application/json")
+		if !renewed {
+			w.WriteHeader(http.StatusNotFound)
+			_ = json.NewEncoder(w).Encode(model.RenewResponse{
+				TenantID:      req.TenantID,
+				ReservationID: req.ReservationID,
+				Renewed:       false,
+				TTLSeconds:    0,
+			})
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(model.RenewResponse{
+			TenantID:      req.TenantID,
+			ReservationID: req.ReservationID,
+			Renewed:       true,
+			TTLSeconds:    ttl,
+		})
+	})
+
 	// Telemetry & Health (Unauthenticated endpoints)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

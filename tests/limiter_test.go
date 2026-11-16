@@ -497,7 +497,32 @@ func TestHTTPProductionRouterStrictAuthentication(t *testing.T) {
 		t.Fatalf("expected non-empty reservation ID in response")
 	}
 
-	// 6. Release endpoint with valid reservation ID -> 200 OK
+	// 6. Renew endpoint with valid reservation ID -> 200 OK with renewed: true
+	renewPayload := fmt.Sprintf(`{"tenant_id":"tenant_free_test","reservation_id":"%s","ttl_seconds":7200}`, checkResp.ReservationID)
+	reqRenew := httptest.NewRequest(http.MethodPost, "/v1/renew", bytes.NewBufferString(renewPayload))
+	reqRenew.Header.Set("X-API-Key", "tg_live_free_key")
+	wRenew := httptest.NewRecorder()
+	mux.ServeHTTP(wRenew, reqRenew)
+	if wRenew.Code != http.StatusOK {
+		t.Fatalf("expected 200 on renew, got: %d, body: %s", wRenew.Code, wRenew.Body.String())
+	}
+
+	var renewResp model.RenewResponse
+	_ = json.NewDecoder(wRenew.Body).Decode(&renewResp)
+	if !renewResp.Renewed || renewResp.ReservationID != checkResp.ReservationID {
+		t.Fatalf("expected renewed: true for valid reservation, got: %+v", renewResp)
+	}
+
+	// 7. Renew endpoint with cross-tenant key mismatch -> 403 Forbidden
+	reqRenewCross := httptest.NewRequest(http.MethodPost, "/v1/renew", bytes.NewBufferString(renewPayload))
+	reqRenewCross.Header.Set("X-API-Key", "tg_live_growth_key")
+	wRenewCross := httptest.NewRecorder()
+	mux.ServeHTTP(wRenewCross, reqRenewCross)
+	if wRenewCross.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden on cross-tenant renew, got: %d", wRenewCross.Code)
+	}
+
+	// 8. Release endpoint with valid reservation ID -> 200 OK
 	relPayload := fmt.Sprintf(`{"tenant_id":"tenant_free_test","reservation_id":"%s"}`, checkResp.ReservationID)
 	req6 := httptest.NewRequest(http.MethodPost, "/v1/release", bytes.NewBufferString(relPayload))
 	req6.Header.Set("X-API-Key", "tg_live_free_key")
@@ -505,6 +530,15 @@ func TestHTTPProductionRouterStrictAuthentication(t *testing.T) {
 	mux.ServeHTTP(w6, req6)
 	if w6.Code != http.StatusOK {
 		t.Fatalf("expected 200 on release, got: %d, body: %s", w6.Code, w6.Body.String())
+	}
+
+	// 9. Renew endpoint for released/expired reservation ID -> 404 Not Found with renewed: false
+	reqRenewAfterRel := httptest.NewRequest(http.MethodPost, "/v1/renew", bytes.NewBufferString(renewPayload))
+	reqRenewAfterRel.Header.Set("X-API-Key", "tg_live_free_key")
+	wRenewAfterRel := httptest.NewRecorder()
+	mux.ServeHTTP(wRenewAfterRel, reqRenewAfterRel)
+	if wRenewAfterRel.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 on renewing released reservation, got: %d", wRenewAfterRel.Code)
 	}
 }
 
@@ -595,5 +629,83 @@ func TestPerReservationExpiryNoReset(t *testing.T) {
 	active, _ = engine.GetActiveCalls(ctx, tenantID)
 	if active != 1 {
 		t.Fatalf("expected 1 active call remaining after Call 1 released, got: %d", active)
+	}
+}
+
+func TestLiveRedisReservationRenewal(t *testing.T) {
+	redisAddr := os.Getenv("REDIS_ADDR")
+	if redisAddr == "" {
+		t.Skip("Skipping live Redis reservation renewal test: REDIS_ADDR not set")
+	}
+
+	rdb := redis.NewClient(&redis.Options{Addr: redisAddr})
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	if err := rdb.Ping(ctx).Err(); err != nil {
+		t.Skipf("Skipping live Redis test: cannot ping Redis at %s: %v", redisAddr, err)
+	}
+
+	engine := limiter.NewEngine(rdb)
+	defer engine.Close()
+
+	tenantID := fmt.Sprintf("tenant_renew_live_%d", time.Now().UnixNano())
+	callKey := fmt.Sprintf("cc:res:%s", tenantID)
+
+	engine.SetTenantPolicy(tenantID, &model.QuotaPolicy{
+		Tier:               model.TierGrowth,
+		RequestsPerMinute:  1000,
+		MaxConcurrentCalls: 5,
+		BurstCapacity:      100,
+		RefillRatePerSec:   100.0,
+	})
+
+	// 1. Reserve Call slot
+	resp, err := engine.Check(ctx, &model.RateLimitRequest{
+		TenantID: tenantID,
+		Resource: "call.initiate",
+		Cost:     1,
+	})
+	if err != nil || !resp.Allowed || resp.ReservationID == "" {
+		t.Fatalf("failed reserving initial call: %+v, err: %v", resp, err)
+	}
+
+	// 2. Renew reservation with custom TTL (e.g. 7200s)
+	nowBefore := time.Now().Unix()
+	renewed := engine.RenewReservation(tenantID, resp.ReservationID, 7200)
+	if !renewed {
+		t.Fatalf("expected successful renewal for active reservation %s", resp.ReservationID)
+	}
+
+	// 3. Inspect Redis ZSET score
+	score, err := rdb.ZScore(ctx, callKey, resp.ReservationID).Result()
+	if err != nil {
+		t.Fatalf("failed getting score from Redis: %v", err)
+	}
+	expectedMinScore := float64(nowBefore + 7195)
+	if score < expectedMinScore {
+		t.Fatalf("expected renewed score >= %f, got %f", expectedMinScore, score)
+	}
+
+	// 4. Renew non-existent reservation ID -> must return false (no phantom reservation created!)
+	fakeRenewed := engine.RenewReservation(tenantID, "res_phantom_fake_id", 3600)
+	if fakeRenewed {
+		t.Fatalf("expected renew to return false for non-existent reservation")
+	}
+	phantomScore, err := rdb.ZScore(ctx, callKey, "res_phantom_fake_id").Result()
+	if err == nil || phantomScore > 0 {
+		t.Fatalf("ZADD XX must never insert non-existent reservation into Redis ZSET!")
+	}
+
+	// 5. Release reservation
+	released := engine.ReleaseCall(tenantID, resp.ReservationID)
+	if !released {
+		t.Fatalf("expected successful release")
+	}
+
+	// 6. Renew after release -> must return false
+	afterReleaseRenewed := engine.RenewReservation(tenantID, resp.ReservationID, 3600)
+	if afterReleaseRenewed {
+		t.Fatalf("expected renew to fail after reservation was released")
 	}
 }

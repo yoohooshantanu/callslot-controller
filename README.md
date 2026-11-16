@@ -51,15 +51,18 @@ Client / Telephony Gateway (CallRelay / External Carrier)
 
 ## 2. Key Technical Capabilities
 
-### A. Dual-Algorithm Rate Limiting
-- **L1 In-Memory Token Bucket**: Employs an atomic in-process token bucket to serve burstable telephony audio chunks in sub-microsecond time (**~869 ns/op**) without incurring network round-trips.
-- **L2 Distributed Sliding Window (Redis Lua Script)**: Enforces precise per-minute requests across distributed gateway nodes using atomic sorted-set (`ZREMRANGEBYSCORE`, `ZCARD`, `ZADD`) transactions.
+### A. Dual-Algorithm Rate Limiting & Architectural Trade-offs
+TenantGate utilizes a multi-tiered rate limiting design balancing sub-microsecond latency with cluster-wide consistency:
+- **L1 In-Memory Token Bucket (Process-Local)**: Employs an atomic in-process token bucket to absorb burstable telephony audio chunks in sub-microsecond time (**~869 ns/op**) without incurring network round-trips. Because L1 state is process-local, maximum instantaneous cluster burst capacity scales with the number of running gateway instances ($N \times \text{BurstCapacity}$).
+- **L2 Distributed Sliding Window (Cluster-Wide Redis Lua)**: Enforces precise per-minute request quotas globally across all distributed gateway nodes using atomic sorted-set (`ZREMRANGEBYSCORE`, `ZCARD`, `ZADD`) transactions.
 
-### B. Distributed Concurrent Voice Session Governor
-Unlike generic HTTP rate limiters that only count requests per second, TenantGate actively tracks **concurrent active calls**:
-- `call.initiate` reserves a slot in Redis via an atomic Lua script (`ReserveCallScript`), ensuring cluster-wide concurrency ceilings (e.g., Free: 5, Growth: 30, Enterprise: 300) are enforced across all server instances.
-- When a call completes, `/v1/release` decrements the session counter via `ReleaseCallScript`.
-- If an L1 burst limit or downstream filter fails, reserved call slots are automatically rolled back without leaking capacity.
+### B. Distributed Concurrent Voice Session Governor & Lease Renewal
+Unlike generic HTTP rate limiters that only count requests per second, TenantGate actively tracks **concurrent active voice sessions**:
+- `call.initiate` assigns an exact `ReservationID` and reserves a slot in Redis via an atomic Lua script (`ReserveCallScript`), ensuring cluster-wide concurrency ceilings (e.g., Free: 5, Growth: 30, Enterprise: 300) are enforced across all server instances.
+- **Per-Reservation Expiry Safety Ceiling**: Each reservation is stored with its individual expiration timestamp in a Redis Sorted Set (`cc:res:<tenant>`). The `DefaultReservationTTL` is 4 hours (14,400s), serving as a fail-safe garbage collection ceiling for abandoned or dropped calls without ever resetting active calls.
+- **Reservation Lease Renewal (`/v1/renew`)**: For long-running calls, telephony workers can periodically renew their active lease via `POST /v1/renew` (`RenewReservation`). This uses atomic `ZADD XX` to extend the expiry timestamp without allowing phantom reservation creation.
+- **Idempotent Slot Release (`/v1/release`)**: When a call completes, `/v1/release` decrements the session counter and removes the specific reservation via `ReleaseCallScript`.
+- **Automatic Rollback**: If an L1 burst limit or downstream filter fails, reserved call slots are automatically rolled back without leaking capacity.
 
 ### C. HTTP Authentication & Tenant Isolation
 - Requests to `/v1/check` and `/v1/release` require valid API keys passed via `X-API-Key`, `Authorization: Bearer <key>`, or `api_key` payload.
@@ -116,12 +119,27 @@ curl -X POST http://localhost:8082/v1/check \
   }'
 ```
 
+### Renewing an Active Call Slot Lease
+```bash
+curl -X POST http://localhost:8082/v1/renew \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: tg_live_free_key" \
+  -d '{
+    "tenant_id": "tenant_free_test",
+    "reservation_id": "res_a1b2c3d4",
+    "ttl_seconds": 14400
+  }'
+```
+
 ### Releasing a Call Slot
 ```bash
 curl -X POST http://localhost:8082/v1/release \
   -H "Content-Type: application/json" \
   -H "X-API-Key: tg_live_free_key" \
-  -d '{"tenant_id": "tenant_free_test"}'
+  -d '{
+    "tenant_id": "tenant_free_test",
+    "reservation_id": "res_a1b2c3d4"
+  }'
 ```
 
 ---

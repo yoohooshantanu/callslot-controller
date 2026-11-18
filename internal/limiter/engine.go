@@ -11,9 +11,9 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
-	"github.com/yoohooshantanu/tenantgate/internal/cache"
-	"github.com/yoohooshantanu/tenantgate/internal/metrics"
-	"github.com/yoohooshantanu/tenantgate/internal/model"
+	"github.com/yoohooshantanu/concurrency-governor/internal/cache"
+	"github.com/yoohooshantanu/concurrency-governor/internal/metrics"
+	"github.com/yoohooshantanu/concurrency-governor/internal/model"
 )
 
 // DefaultReservationTTL defines the maximum safety ceiling before an abandoned reservation is purged (4 hours)

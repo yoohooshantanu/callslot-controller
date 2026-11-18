@@ -1,9 +1,9 @@
-# TenantGate: Low-Latency Distributed Multi-Tenant Rate Limiter & Concurrency Governor
+# ConcurrencyGovernor: Low-Latency Distributed Multi-Tenant Rate Limiter & Concurrency Governor
 
-[![CI Pipeline](https://github.com/yoohooshantanu/tenantgate/actions/workflows/ci.yml/badge.svg)](https://github.com/yoohooshantanu/tenantgate/actions)
+[![CI Pipeline](https://github.com/yoohooshantanu/concurrency-governor/actions/workflows/ci.yml/badge.svg)](https://github.com/yoohooshantanu/concurrency-governor/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-**TenantGate** is a low-latency, distributed multi-tenant rate limiting and concurrent call capacity governor written in Go. It is designed to sit at the edge or ingress of AI voice and telephony infrastructure to prevent API abuse, enforce tier-based quotas, eliminate noisy neighbors, and protect against LLM credit exhaustion.
+**ConcurrencyGovernor** is a low-latency, distributed multi-tenant rate limiting and concurrent call capacity governor written in Go. It is designed to sit at the edge or ingress of AI voice and telephony infrastructure to prevent API abuse, enforce tier-based quotas, eliminate noisy neighbors, and protect against LLM credit exhaustion.
 
 ---
 
@@ -52,12 +52,12 @@ Client / Telephony Gateway (CallRelay / External Carrier)
 ## 2. Key Technical Capabilities
 
 ### A. Dual-Algorithm Rate Limiting & Architectural Trade-offs
-TenantGate utilizes a multi-tiered rate limiting design balancing sub-microsecond latency with cluster-wide consistency:
+ConcurrencyGovernor utilizes a multi-tiered rate limiting design balancing sub-microsecond latency with cluster-wide consistency:
 - **L1 In-Memory Token Bucket (Process-Local)**: Employs an atomic in-process token bucket to absorb burstable telephony audio chunks in sub-microsecond time (**~869 ns/op**) without incurring network round-trips. Because L1 state is process-local, maximum instantaneous cluster burst capacity scales with the number of running gateway instances ($N \times \text{BurstCapacity}$).
 - **L2 Distributed Sliding Window (Cluster-Wide Redis Lua)**: Enforces precise per-minute request quotas globally across all distributed gateway nodes using atomic sorted-set (`ZREMRANGEBYSCORE`, `ZCARD`, `ZADD`) transactions.
 
 ### B. Distributed Concurrent Voice Session Governor & Lease Renewal
-Unlike generic HTTP rate limiters that only count requests per second, TenantGate actively tracks **concurrent active voice sessions**:
+Unlike generic HTTP rate limiters that only count requests per second, ConcurrencyGovernor actively tracks **concurrent active voice sessions**:
 - `call.initiate` assigns an exact `ReservationID` and reserves a slot in Redis via an atomic Lua script (`ReserveCallScript`), ensuring cluster-wide concurrency ceilings (e.g., Free: 5, Growth: 30, Enterprise: 300) are enforced across all server instances.
 - **Per-Reservation Expiry Safety Ceiling**: Each reservation is stored with its individual expiration timestamp in a Redis Sorted Set (`cc:res:<tenant>`). The `DefaultReservationTTL` is 4 hours (14,400s), serving as a fail-safe garbage collection ceiling for abandoned or dropped calls without ever resetting active calls.
 - **Reservation Lease Renewal (`/v1/renew`)**: For long-running calls, telephony workers can periodically renew their active lease via `POST /v1/renew` (`RenewReservation`). This uses atomic `ZADD XX` to extend the expiry timestamp without allowing phantom reservation creation.
@@ -81,10 +81,10 @@ Every evaluation returns standard HTTP rate-limiting headers:
 Evaluated under high concurrency using Go's native benchmark framework:
 
 ```bash
-$ go test -bench="BenchmarkTenantGateL1Check" -benchmem ./tests/...
-BenchmarkTenantGateL1Check-8    1455925    869.1 ns/op    160 B/op    4 allocs/op
+$ go test -bench="BenchmarkConcurrencyGovernorL1Check" -benchmem ./tests/...
+BenchmarkConcurrencyGovernorL1Check-8    1455925    869.1 ns/op    160 B/op    4 allocs/op
 PASS
-ok      github.com/yoohooshantanu/tenantgate/tests    6.718s
+ok      github.com/yoohooshantanu/concurrency-governor/tests    6.718s
 ```
 
 - **Evaluation Speed**: **~869 nanoseconds per decision** on the hot path.
@@ -97,8 +97,8 @@ ok      github.com/yoohooshantanu/tenantgate/tests    6.718s
 ### Running Standalone
 ```bash
 # Clone the repository
-git clone https://github.com/yoohooshantanu/tenantgate.git
-cd tenantgate
+git clone https://github.com/yoohooshantanu/concurrency-governor.git
+cd concurrency-governor
 
 # Run tests
 go test -v ./tests/...
@@ -147,7 +147,7 @@ curl -X POST http://localhost:8082/v1/release \
 ## 5. Repository Layout
 
 ```
-tenantgate/
+concurrency-governor/
 ├── cmd/server/main.go            # Entrypoint, route handlers, auth middleware, IETF headers
 ├── internal/
 │   ├── model/types.go            # Domain models: QuotaPolicy, TierLevel, RateLimitRequest/Response

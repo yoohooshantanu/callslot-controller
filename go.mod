@@ -1,4 +1,4 @@
-module github.com/yoohooshantanu/tenantgate
+module github.com/yoohooshantanu/concurrency-governor
 
 go 1.23.0
 

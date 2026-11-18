@@ -16,9 +16,9 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
-	"github.com/yoohooshantanu/tenantgate/internal/limiter"
-	"github.com/yoohooshantanu/tenantgate/internal/model"
-	"github.com/yoohooshantanu/tenantgate/internal/server"
+	"github.com/yoohooshantanu/concurrency-governor/internal/limiter"
+	"github.com/yoohooshantanu/concurrency-governor/internal/model"
+	"github.com/yoohooshantanu/concurrency-governor/internal/server"
 )
 
 func TestTokenBucketBurstLimiting(t *testing.T) {

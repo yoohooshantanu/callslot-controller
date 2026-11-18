@@ -8,9 +8,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/yoohooshantanu/tenantgate/internal/limiter"
-	"github.com/yoohooshantanu/tenantgate/internal/logger"
-	"github.com/yoohooshantanu/tenantgate/internal/server"
+	"github.com/yoohooshantanu/concurrency-governor/internal/limiter"
+	"github.com/yoohooshantanu/concurrency-governor/internal/logger"
+	"github.com/yoohooshantanu/concurrency-governor/internal/server"
 )
 
 func getEnv(key, defaultVal string) string {
@@ -24,7 +24,7 @@ func main() {
 	port := getEnv("PORT", "8082")
 	redisAddr := os.Getenv("REDIS_ADDR")
 
-	logger.L.Info("starting_tenantgate", "port", port)
+	logger.L.Info("starting_concurrency-governor", "port", port)
 
 	// Strict fail-closed startup validation:
 	// If REDIS_ADDR is configured, failing the initial ping halts startup rather than silently falling back
@@ -52,7 +52,7 @@ func main() {
 	}
 
 	go func() {
-		logger.L.Info("tenantgate_listening", "port", port)
+		logger.L.Info("concurrency_governor_listening", "port", port)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			logger.L.Error("server_listen_failed", "error", err)
 		}
@@ -62,11 +62,11 @@ func main() {
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 
-	logger.L.Info("shutting_down_tenantgate")
+	logger.L.Info("shutting_down_concurrency-governor")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	_ = srv.Shutdown(ctx)
 	engine.Close()
-	logger.L.Info("tenantgate_terminated_cleanly")
+	logger.L.Info("concurrency_governor_terminated_cleanly")
 }

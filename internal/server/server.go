@@ -12,9 +12,9 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
-	"github.com/yoohooshantanu/tenantgate/internal/limiter"
-	"github.com/yoohooshantanu/tenantgate/internal/metrics"
-	"github.com/yoohooshantanu/tenantgate/internal/model"
+	"github.com/yoohooshantanu/concurrency-governor/internal/limiter"
+	"github.com/yoohooshantanu/concurrency-governor/internal/metrics"
+	"github.com/yoohooshantanu/concurrency-governor/internal/model"
 )
 
 // InitRedis creates and validates a Redis client connection.

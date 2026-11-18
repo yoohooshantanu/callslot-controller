@@ -26,8 +26,10 @@ func main() {
 
 	logger.L.Info("starting_concurrency-governor", "port", port)
 
+	// -------
 	// Strict fail-closed startup validation:
-	// If REDIS_ADDR is configured, failing the initial ping halts startup rather than silently falling back
+	// If REDIS_ADDR is configured, failing initial ping halts startup immediately.
+	// -------
 	rdb, err := server.InitRedis(redisAddr)
 	if err != nil {
 		logger.L.Error("fatal_redis_startup_error_fail_closed", "error", err)

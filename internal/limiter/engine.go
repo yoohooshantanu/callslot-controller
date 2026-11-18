@@ -225,18 +225,21 @@ func (e *Engine) Check(ctx context.Context, req *model.RateLimitRequest) (*model
 		}
 	}
 
-	// 1. Check Concurrent Calls Cap for call initiation requests
+	// -------
+	// 1. Evaluate concurrent calls cap for call initiation requests
+	// -------
 	if req.Resource == "call.initiate" {
 		resID := generateReservationID(req.TenantID)
 
 		if e.rdb != nil {
-			// Distributed Atomic Concurrency Reservation in Redis via Sorted Set
 			callKey := fmt.Sprintf("cc:res:%s", req.TenantID)
 			nowSec := time.Now().Unix()
 
 			res, err := e.evalScript(ctx, e.reserveCallSHA, ReserveCallScript, []string{callKey}, resID, policy.MaxConcurrentCalls, nowSec, DefaultReservationTTL)
 			if err != nil {
+				// -------
 				// FAIL-CLOSED: Redis failure must reject requests rather than bypassing limits
+				// -------
 				metrics.DefaultMetrics.IncCheck(false, true)
 				return &model.RateLimitResponse{
 					Allowed:         false,
@@ -299,12 +302,13 @@ func (e *Engine) Check(ctx context.Context, req *model.RateLimitRequest) (*model
 		}
 	}
 
-	// 2. High-speed Fast Path: L1 Token Bucket Cache
+	// -------
+	// 2. High-speed fast path: L1 local token bucket cache
+	// -------
 	bucketKey := fmt.Sprintf("tb:%s:%s", req.TenantID, req.Resource)
 	l1Allowed, l1Rem := e.l1Cache.AllowTokenBucket(bucketKey, policy.BurstCapacity, policy.RefillRatePerSec, cost)
 
 	if !l1Allowed {
-		// Strict rejection from local burst governor; release reserved call slot if any
 		rollbackCallSlot()
 		metrics.DefaultMetrics.IncCheck(false, true)
 		return &model.RateLimitResponse{
@@ -317,7 +321,9 @@ func (e *Engine) Check(ctx context.Context, req *model.RateLimitRequest) (*model
 		}, nil
 	}
 
-	// 3. Sliding Window Check (Redis or In-Memory fallback)
+	// -------
+	// 3. Sliding-window rate limit evaluation (Redis cluster or in-memory fallback)
+	// -------
 	if e.rdb != nil {
 		windowKey := fmt.Sprintf("rl:%s:%s", req.TenantID, req.Resource)
 		nowMs := time.Now().UnixMilli()
@@ -325,7 +331,9 @@ func (e *Engine) Check(ctx context.Context, req *model.RateLimitRequest) (*model
 
 		res, err := e.evalScript(ctx, e.slidingSHA, SlidingWindowScript, []string{windowKey}, nowMs, windowMs, policy.RequestsPerMinute, cost)
 		if err != nil {
+			// -------
 			// FAIL-CLOSED: Redis cluster failure must not bypass sliding-window limits
+			// -------
 			rollbackCallSlot()
 			metrics.DefaultMetrics.IncCheck(false, true)
 			return &model.RateLimitResponse{

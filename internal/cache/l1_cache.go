@@ -51,7 +51,9 @@ func (c *L1LocalCache) AllowTokenBucket(key string, capacity int64, refillRatePe
 		c.buckets[key] = entry
 	}
 
+	// -------
 	// Refill tokens based on elapsed duration (guarded against negative elapsed time under clock skew)
+	// -------
 	elapsed := now.Sub(entry.LastRefill).Seconds()
 	if elapsed > 0 {
 		entry.Tokens += elapsed * refillRatePerSec
@@ -61,7 +63,6 @@ func (c *L1LocalCache) AllowTokenBucket(key string, capacity int64, refillRatePe
 		entry.LastRefill = now
 	}
 
-	// Check if sufficient tokens exist
 	if entry.Tokens >= float64(cost) {
 		entry.Tokens -= float64(cost)
 		return true, int64(entry.Tokens)

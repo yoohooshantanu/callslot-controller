@@ -75,7 +75,9 @@ func ValidateAuth(r *http.Request, keyRegistry map[string]string, requestTenantI
 		return "", fmt.Errorf("invalid API key")
 	}
 
-	// Strictly enforce tenant ownership: No bypasses or test exceptions permitted
+	// -------
+	// Strictly enforce tenant ownership: no bypasses or test exceptions permitted
+	// -------
 	if requestTenantID != "" && requestTenantID != boundTenant {
 		return boundTenant, fmt.Errorf("forbidden: cross-tenant key mismatch")
 	}
@@ -87,7 +89,9 @@ func ValidateAuth(r *http.Request, keyRegistry map[string]string, requestTenantI
 func SetupRouter(engine *limiter.Engine, keyRegistry map[string]string) *http.ServeMux {
 	mux := http.NewServeMux()
 
+	// -------
 	// High-speed Check API (RateLimit policy decision)
+	// -------
 	mux.HandleFunc("/v1/check", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
@@ -101,7 +105,6 @@ func SetupRouter(engine *limiter.Engine, keyRegistry map[string]string) *http.Se
 			return
 		}
 
-		// Authenticate request
 		_, authErr := ValidateAuth(r, keyRegistry, req.TenantID, req.APIKey)
 		if authErr != nil {
 			statusCode := http.StatusUnauthorized
@@ -118,7 +121,9 @@ func SetupRouter(engine *limiter.Engine, keyRegistry map[string]string) *http.Se
 			return
 		}
 
-		// Set IETF standard rate limiting response headers
+		// -------
+		// Standard IETF rate limit response headers
+		// -------
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("RateLimit-Limit", strconv.FormatInt(resp.Limit, 10))
 		w.Header().Set("RateLimit-Remaining", strconv.FormatInt(resp.RemainingQuota, 10))
@@ -133,7 +138,9 @@ func SetupRouter(engine *limiter.Engine, keyRegistry map[string]string) *http.Se
 		_ = json.NewEncoder(w).Encode(resp)
 	})
 
-	// Release concurrent call session: /v1/release (Idempotent by Reservation ID)
+	// -------
+	// Release concurrent call session (idempotent by reservation ID)
+	// -------
 	mux.HandleFunc("/v1/release", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
@@ -171,7 +178,9 @@ func SetupRouter(engine *limiter.Engine, keyRegistry map[string]string) *http.Se
 		})
 	})
 
-	// Renew concurrent call session lease: /v1/renew
+	// -------
+	// Renew concurrent call session lease
+	// -------
 	mux.HandleFunc("/v1/renew", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
@@ -190,7 +199,6 @@ func SetupRouter(engine *limiter.Engine, keyRegistry map[string]string) *http.Se
 			return
 		}
 
-		// Authenticate request
 		_, authErr := ValidateAuth(r, keyRegistry, req.TenantID, req.APIKey)
 		if authErr != nil {
 			statusCode := http.StatusUnauthorized
@@ -228,7 +236,9 @@ func SetupRouter(engine *limiter.Engine, keyRegistry map[string]string) *http.Se
 		})
 	})
 
-	// Telemetry & Health (Unauthenticated endpoints)
+	// -------
+	// Telemetry and observability endpoints
+	// -------
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{

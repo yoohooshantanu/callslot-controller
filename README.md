@@ -1,13 +1,13 @@
-# ConcurrencyGovernor
+# CallSlotController
 
-[![CI](https://github.com/yoohooshantanu/tenantgate/actions/workflows/ci.yml/badge.svg)](https://github.com/yoohooshantanu/tenantgate/actions/workflows/ci.yml)
+[![CI](https://github.com/yoohooshantanu/callslot-controller/actions/workflows/ci.yml/badge.svg)](https://github.com/yoohooshantanu/callslot-controller/actions/workflows/ci.yml)
 ![Go](https://img.shields.io/badge/Go-1.23%2B-00ADD8)
 ![Redis](https://img.shields.io/badge/Redis-7%2B-DC382D)
 ![RateLimit](https://img.shields.io/badge/RateLimit-IETF%20Draft-blue)
 
 A distributed multi-tenant rate limiter and concurrent voice call capacity governor written in Go. It sits at the ingress of telephony and voice AI infrastructure and evaluates rate limits and concurrent call quotas using a two-tier hierarchy: a sub-microsecond in-process token bucket (L1) and a distributed Redis sliding-window with stateful call reservations (L2).
 
-*(The GitHub repo is called tenantgate. The Go module and binary are named concurrency-governor from an architectural rename.)*
+
 
 ### Key Technical Highlights
 - **Sub-Microsecond Local Burst Fast Path:** Evaluates high-frequency audio packet bursts in ~869 ns via an in-memory mutex-protected cache (`L1LocalCache`), absorbing bursts locally before global Redis evaluation.
@@ -325,8 +325,8 @@ RateLimit-Reset: 60
 ### Quickstart (30 seconds)
 
 ```bash
-git clone https://github.com/yoohooshantanu/tenantgate.git
-cd tenantgate
+git clone https://github.com/yoohooshantanu/callslot-controller.git
+cd callslot-controller
 
 # Run in-memory unit tests with race detector
 go test -v -race ./tests/...

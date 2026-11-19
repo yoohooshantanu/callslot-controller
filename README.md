@@ -5,7 +5,7 @@
 ![Redis](https://img.shields.io/badge/Redis-7%2B-DC382D)
 ![RateLimit](https://img.shields.io/badge/RateLimit-IETF%20Draft-blue)
 
-A distributed multi-tenant rate limiter and concurrent voice call capacity governor written in Go. It sits at the ingress of telephony and AI voice infrastructure and decides in ~869 ns whether an incoming request or active call is permitted to initiate, burst, or continue.
+A distributed multi-tenant rate limiter and concurrent voice call capacity governor written in Go. It sits at the ingress of telephony and voice AI infrastructure and decides in ~869 ns whether an incoming request or active call is permitted to initiate, burst, or continue.
 
 *(The GitHub repo is called tenantgate. The Go module and binary are named concurrency-governor from an architectural rename.)*
 
@@ -18,8 +18,8 @@ A distributed multi-tenant rate limiter and concurrent voice call capacity gover
 
 ## Contents
 
-- [Production Role & Problem](#production-role--problem)
-- [System Scope & Integration Boundaries](#system-scope--integration-boundaries)
+- [The Idea and Problem](#the-idea-and-problem)
+- [What is Real and What is Mocked](#what-is-real-and-what-is-mocked)
 - [Architecture & Decision Flow](#architecture--decision-flow)
 - [The Subsystems, One by One](#the-subsystems-one-by-one)
 - [API](#api)
@@ -27,60 +27,46 @@ A distributed multi-tenant rate limiter and concurrent voice call capacity gover
 - [Observability](#observability)
 - [Tests](#tests)
 - [Performance](#performance)
-- [Architectural Trade-offs](#architectural-trade-offs)
+- [Limitations and Rough Edges](#limitations-and-rough-edges)
 - [Repo Map](#repo-map)
 
 ---
 
-## Production Role & Problem
+## The Idea and Problem
 
-In telephony and real-time voice AI platforms (e.g. Twilio, Retell AI, Callease.ai), traffic characteristics break traditional web rate limiters:
+A voice platform experiences two fundamentally different traffic shapes at the same time:
 
-1. **High-Frequency Packet Bursts:** Active calls stream audio frames every 20 ms (50 packets per second per call). Fifty concurrent calls generate 2,500 evaluations per second. If an ingress gateway makes a network round-trip to Redis (1–2 ms) for every audio frame, it introduces unacceptable jitter and exhausts gateway connections.
-2. **Sustained Concurrency vs Request Quotas:** Traditional limiters measure *requests per minute*. But a voice call lasts 5 to 30 minutes. A customer who starts 50 simultaneous calls on a 10-call plan makes only 50 initiate requests—easily passing standard per-minute filters. Yet they consume 50 live SIP channels, 50 LLM sessions, and 50 audio transcribers for half an hour, starving other enterprise tenants.
-3. **Leaked Capacity on Partial Failures:** If a system reserves a call slot but rejects the request downstream (e.g. invalid auth or burst quota exceeded), failing to release that reservation results in phantom capacity depletion.
+1. **High-Frequency Request Bursts:** An active call sends one audio packet every 20 ms—50 per second per call. Fifty concurrent calls produce 2,500 evaluations per second. Each check must return in nanoseconds; a 1–2 ms network round-trip to Redis for every audio packet adds cumulative delay and exhausts network sockets.
+2. **Long-Duration Concurrent Sessions:** A phone call lasts 3 to 15 minutes, consuming a live telephony trunk, an LLM context session, and real-time speech synthesis bandwidth. Standard request-per-minute rate limiters cannot protect against a tenant who initiates 50 simultaneous calls on a 10-call plan: they only made 50 initiate requests (passing per-minute quotas), yet they monopolize concurrency capacity for half an hour.
+3. **Capacity Leakage on Partial Failures:** If a system reserves a call slot but rejects the request downstream (e.g. burst limit exceeded), failing to release that reservation results in leaked capacity over time.
 
-### Where ConcurrencyGovernor Sits in the Voice Stack
+### System Position in the Voice Stack
 
+```mermaid
+flowchart TD
+    Ingress["Inbound API / Telephony Ingress Gateway"] -->|POST /v1/check| Gov["ConcurrencyGovernor"]
+    subgraph DecisionEngine ["ConcurrencyGovernor Core"]
+        Gov --> L1["L1 In-Memory Token Bucket\n(~869 ns local burst filter)"]
+        Gov --> L2["L2 Redis Sliding Window\n(Distributed global per-minute quota)"]
+        Gov --> Slots["Call Slot Governor\n(Redis ZSET with per-reservation expiry)"]
+    end
+    Gov -->|200 OK + IETF RateLimit Headers| Downstream["Telephony Trunks / AI Media Workers"]
+    Gov -->|429 RateLimitExceeded / ConcurrencyExceeded| Reject["Client 429 Too Many Requests"]
 ```
-[ Inbound API / SIP Signaling / Audio Gateway ]
-                       │
-                       ▼
-┌─────────────────────────────────────────────────────────────┐
-│                    ConcurrencyGovernor                      │
-│                                                             │
-│   Fast Path (~869 ns)              Distributed Path (~1 ms) │
-│   ┌──────────────────┐               ┌──────────────────┐   │
-│   │  L1 Token Bucket │               │  L2 Sliding Win  │   │
-│   │ (In-Memory/Burst)│               │ (Global Cluster) │   │
-│   └─────────┬────────┘               └────────▲─────────┘   │
-│             │ Allowed                         │ Allowed     │
-│             ▼                                 │             │
-│   ┌───────────────────────────────────────────┴─────────┐   │
-│   │            Call Slot Concurrency Governor           │   │
-│   │    Atomic Redis Lua ZSET + Lease Expiration Engine  │   │
-│   └─────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────┘
-                       │
-                       ▼ (Authorized)
-      [ Media Servers / SIP Telephony Trunks ]
-```
-
-ConcurrencyGovernor inspects every ingress call attempt and audio burst before traffic touches media servers or telephony trunks.
 
 ---
 
-## System Scope & Integration Boundaries
+## What is Real and What is Mocked
 
-In production deployments, policy definition and billing reside in central control planes. ConcurrencyGovernor operates as the **stateless, high-throughput enforcement plane**:
-
-| Subsystem | Production-Ready Core in this Repo | Decoupled External Interface |
-| :--- | :--- | :--- |
-| **Burst Limiting (L1)** | In-memory token bucket per tenant with continuous fractional refill; evaluates in ~869 ns with zero heap allocations on the hot path. | Local fast-path filter; automatically adapts to multi-pod configurations. |
-| **Global Quota (L2)** | Atomic Redis Lua script managing a sliding log (`ZREMRANGEBYSCORE`, `ZCARD`, `ZADD`) for precise per-minute enforcement across instances. | Redis 7+ cluster or standalone Redis; key namespacing per tenant. |
-| **Call Capacity Governor** | Stateful Sorted Set tracker (`ReserveCallScript`, `ReleaseCallScript`, `RenewCallScript`) with individual TTLs and automatic rollback on failure. | Telephony session manager; pairs with SIP dialog events (`INVITE`, `BYE`). |
-| **Resilience & Startup** | Fail-closed initialization: if Redis is configured but unreachable on boot, the service terminates immediately (`os.Exit(1)`) rather than running uncoordinated. | SRE orchestration; prevents uncoordinated split-brain capacity leakage. |
-| **Standardized Headers** | Automatic computation of IETF Draft `RateLimit-Limit`, `RateLimit-Remaining`, and `RateLimit-Reset` headers on all responses. | Downstream SDK compliance. |
+| Real | Mocked or Simplified |
+| :--- | :--- |
+| **L1 in-process token bucket:** Continuous fractional refill based on elapsed nanoseconds, evaluated without network I/O. | **Static Tier Policies:** Quotas are configured as Go structs (Free, Growth, Enterprise). There is no admin API or database table for dynamic runtime policy updates. |
+| **L2 distributed sliding window:** Atomic Redis Lua script (`ZREMRANGEBYSCORE`, `ZCARD`, `ZADD`) for global per-minute enforcement across instances. | **Static Key Registry:** API key to tenant ID mapping is loaded from environment variables (`TENANTGATE_API_KEYS`) on startup. No dynamic key rotation or RBAC. |
+| **Active call slot governor:** Redis ZSET with per-reservation expiry timestamps (`ReserveCallScript`, `ReleaseCallScript`, `RenewCallScript`). | **Billing Deduction:** The governor denies requests on quota exhaustion, but does not deduct credits or interact with payment gateways. |
+| **Automatic rollback:** If a call slot is reserved but L1 or L2 rejects, the slot is released before returning `429`. | |
+| **Fail-closed startup:** If `REDIS_ADDR` is configured and unreachable on boot, the process terminates immediately (`os.Exit(1)`). | |
+| **IETF response headers:** `RateLimit-Limit`, `RateLimit-Remaining`, and `RateLimit-Reset` calculated on all evaluations. | |
+| **18 tests and 2 microbenchmarks**, run with `-race` against live Redis 7 containers in GitHub Actions CI. | |
 
 ---
 
@@ -88,25 +74,25 @@ In production deployments, policy definition and billing reside in central contr
 
 ```mermaid
 flowchart TD
-    A["Inbound Request\n(Header: x-api-key, Type: call.initiate | audio.chunk)"] --> B["Authenticate & Bind Tenant\n(Constant-time key lookup)"]
-    B -->|invalid key| C["401 Unauthorized"]
-    B -->|valid key| D{"Is Concurrent Call\nReservation Required?"}
+    A["Inbound Request\n(Header: X-API-Key, Resource: call.initiate | audio.chunk)"] --> B["ValidateAuth: Constant-time key lookup & tenant binding"]
+    B -->|invalid key| C["401 Unauthorized / 403 Forbidden"]
+    B -->|valid key| D{"Is Resource == call.initiate?"}
 
-    D -->|yes: call.initiate| E["ReserveCallSlot(tenantID, callID)\nAtomic Redis Lua ZSET"]
-    E -->|capacity full| F["429 Too Many Requests\nReason: CONCURRENT_CALLS_EXCEEDED"]
+    D -->|yes| E["ReserveCallSlot(tenantID, resID)\nAtomic Redis Lua ZSET"]
+    E -->|capacity full| F["429 Too Many Requests\nViolationReason: CONCURRENT_CALLS_EXCEEDED"]
     E -->|slot reserved| G["Evaluate L1 In-Memory Token Bucket"]
 
-    D -->|no: audio chunk / API req| G
+    D -->|no| G
 
     G -->|burst rejected| H{"Was Call Slot\nReserved?"}
-    H -->|yes| I["RollbackCallSlot(tenantID, callID)\nAtomic Lua Release"]
-    I --> J["429 Too Many Requests\nReason: RATE_LIMIT_EXCEEDED (L1)"]
+    H -->|yes| I["rollbackCallSlot(tenantID, resID)\nAtomic Lua ZREM"]
+    I --> J["429 Too Many Requests\nViolationReason: RATE_LIMIT_EXCEEDED (L1)"]
     H -->|no| J
 
     G -->|burst allowed| K["Evaluate L2 Redis Sliding Window"]
     K -->|quota rejected| L{"Was Call Slot\nReserved?"}
-    L -->|yes| M["RollbackCallSlot(tenantID, callID)\nAtomic Lua Release"]
-    M --> N["429 Too Many Requests\nReason: RATE_LIMIT_EXCEEDED (L2)"]
+    L -->|yes| M["rollbackCallSlot(tenantID, resID)\nAtomic Lua ZREM"]
+    M --> N["429 Too Many Requests\nViolationReason: RATE_LIMIT_EXCEEDED (L2)"]
     L -->|no| N
 
     K -->|quota allowed| O["200 OK + IETF RateLimit Headers\nForward to Telephony / AI Worker"]
@@ -118,9 +104,9 @@ flowchart TD
 
 ### 1. Two-Tier Rate Limiting: L1 Local + L2 Global
 
-Audio streams cannot tolerate a 2ms Redis network round-trip on every 20ms frame. ConcurrencyGovernor solves this using a two-tier hierarchy:
+Audio packet streams cannot tolerate a 1–2ms Redis round-trip for every 20ms frame. ConcurrencyGovernor uses a layered design:
 
-- **L1 In-Memory Token Bucket:** Absorbs high-frequency audio chunk traffic in sub-microsecond time. Refill is computed dynamically from elapsed wall-clock nanoseconds without background ticks:
+- **L1 In-Memory Token Bucket:** Absorbs high-frequency audio chunk traffic in sub-microsecond time. Refill is calculated dynamically from elapsed wall-clock nanoseconds without background ticks:
 
 ```go
 // internal/cache/l1_cache.go
@@ -141,7 +127,7 @@ func (b *TokenBucket) Allow(cost int64) bool {
 }
 ```
 
-- **L2 Redis Sliding Window:** Synchronizes global requests-per-minute limits across multiple gateway instances using an atomic Redis Lua script:
+- **L2 Redis Sliding Window:** Synchronizes global requests-per-minute limits across multiple gateway instances via atomic Lua:
 
 ```lua
 -- SlidingWindowScript (internal/limiter/engine.go)
@@ -164,14 +150,14 @@ end
 
 ### 2. Stateful Call Slot Governor (Redis ZSET)
 
-Concurrent call limits are enforced via `ReserveCallScript`. Instead of a blunt integer counter (which leaks if an instance crashes before releasing), reservations are stored in a Redis Sorted Set with their expiry timestamp as the score:
+Concurrent call limits are enforced via `ReserveCallScript`. Instead of an integer counter (which leaks if an instance crashes before releasing), reservations are stored in a Redis Sorted Set with their expiry timestamp as the score:
 
 ```lua
 -- ReserveCallScript (internal/limiter/engine.go)
 local key = KEYS[1]
 local now = tonumber(ARGV[1])
 local maxCalls = tonumber(ARGV[2])
-local callID = ARGV[3]
+local resID = ARGV[3]
 local expiry = tonumber(ARGV[4])
 
 -- Clean expired sessions lazily
@@ -179,30 +165,29 @@ redis.call('ZREMRANGEBYSCORE', key, '-inf', now)
 local active = redis.call('ZCARD', key)
 
 if active < maxCalls then
-    redis.call('ZADD', key, expiry, callID)
+    redis.call('ZADD', key, expiry, resID)
     return {1, maxCalls - active - 1}
 else
     return {0, 0}
 end
 ```
 
-If a media server dies without sending a teardown signal, the orphaned call expires automatically after the reservation TTL without operator intervention.
+If a client dies without releasing, the reservation expires automatically when `now >= expiry`.
 
 ### 3. Guaranteed Slot Rollback
 
-When a tenant makes a `call.initiate` request, the call slot is reserved first. If the request subsequently fails L1 or L2 rate limits, the reserved slot must be rolled back immediately. Otherwise, an abusive tenant could exhaust their own concurrent call cap with rejected requests:
+When a client makes a `call.initiate` request, the call slot is reserved first. If the request subsequently fails L1 or L2 rate limits, the reserved slot is rolled back immediately:
 
 ```go
 // internal/limiter/engine.go
 if decision.Allowed {
-    // Both tiers passed
     return decision, nil
 }
 
 // Downstream check failed: perform atomic rollback
 if slotReserved {
-    if err := e.rollbackCallSlot(ctx, tenantID, req.CallID); err != nil {
-        logger.Error("failed to rollback call slot", "call_id", req.CallID, "error", err)
+    if err := e.rollbackCallSlot(ctx, req.TenantID, resID); err != nil {
+        logger.L.Error("failed_to_rollback_call_slot", "reservation_id", resID, "error", err)
     }
 }
 return decision, nil
@@ -212,37 +197,38 @@ return decision, nil
 
 ### 4. Fail-Closed Redis Startup
 
-If Redis is configured but unreachable on startup, falling back to an in-memory limiter creates a dangerous failure mode: each gateway instance permits the entire global quota, multiplying total system throughput by the replica count and overwhelming downstream carriers.
-
-ConcurrencyGovernor fails closed on startup:
+If Redis is configured but unreachable on startup, ConcurrencyGovernor terminates immediately:
 
 ```go
-// cmd/server/main.go
-if cfg.RedisAddr != "" {
-    client := redis.NewClient(&redis.Options{Addr: cfg.RedisAddr})
-    ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-    defer cancel()
-    if err := client.Ping(ctx).Err(); err != nil {
-        logger.Error("FATAL: Redis configured but unreachable at startup", "addr", cfg.RedisAddr, "error", err)
-        os.Exit(1)
-    }
+// internal/server/server.go: InitRedis
+if redisAddr == "" {
+    return nil, nil // Intentional standalone in-memory mode
+}
+
+rdb := redis.NewClient(&redis.Options{Addr: redisAddr})
+ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+defer cancel()
+
+if err := rdb.Ping(ctx).Err(); err != nil {
+    return nil, fmt.Errorf("redis startup ping failed for %s: %w", redisAddr, err)
 }
 ```
 
-`TestServerFailsClosedWhenRedisDown` exercises this crash-fast behavior.
+`TestFailClosedRedisStartup` exercises this fail-closed behavior.
 
 ---
 
 ## API
 
-### Rate Limit Decision Endpoint: `POST /v1/check`
+### 1. Check Rate Limit & Reserve Concurrency: `POST /v1/check`
+
+Requires header: `X-API-Key: <key>` or `Authorization: Bearer <key>`.
 
 #### Request:
 ```json
 {
-  "api_key": "growth-key-123",
-  "request_type": "call.initiate",
-  "call_id": "call-9941a8",
+  "tenant_id": "tenant-growth",
+  "resource": "call.initiate",
   "cost": 1
 }
 ```
@@ -251,15 +237,21 @@ if cfg.RedisAddr != "" {
 ```http
 HTTP/1.1 200 OK
 Content-Type: application/json
-RateLimit-Limit: 600
-RateLimit-Remaining: 598
-RateLimit-Reset: 42
+RateLimit-Limit: 300
+RateLimit-Remaining: 299
+RateLimit-Reset: 60
 
 {
   "allowed": true,
-  "tenant_id": "tenant-growth",
-  "remaining_calls": 29,
-  "reason": ""
+  "limit": 300,
+  "current_usage": 1,
+  "remaining_quota": 299,
+  "reset_after_seconds": 60,
+  "active_calls": 1,
+  "max_concurrent_calls": 25,
+  "reservation_id": "res_8829a1fc",
+  "violation_reason": "",
+  "checked_at": "2026-11-19T18:00:00Z"
 }
 ```
 
@@ -267,15 +259,39 @@ RateLimit-Reset: 42
 ```http
 HTTP/1.1 429 Too Many Requests
 Content-Type: application/json
-RateLimit-Limit: 30
+RateLimit-Limit: 25
 RateLimit-Remaining: 0
-RateLimit-Reset: 15
+RateLimit-Reset: 60
 
 {
   "allowed": false,
+  "limit": 25,
+  "current_usage": 25,
+  "remaining_quota": 0,
+  "reset_after_seconds": 60,
+  "active_calls": 25,
+  "max_concurrent_calls": 25,
+  "reservation_id": "",
+  "violation_reason": "CONCURRENT_CALLS_EXCEEDED",
+  "checked_at": "2026-11-19T18:00:00Z"
+}
+```
+
+### 2. Release Call Slot: `POST /v1/release`
+
+```json
+{
   "tenant_id": "tenant-growth",
-  "remaining_calls": 0,
-  "reason": "CONCURRENT_CALLS_EXCEEDED"
+  "reservation_id": "res_8829a1fc"
+}
+```
+
+### 3. Renew Call Lease: `POST /v1/renew`
+
+```json
+{
+  "tenant_id": "tenant-growth",
+  "reservation_id": "res_8829a1fc"
 }
 ```
 
@@ -312,11 +328,10 @@ Prometheus metrics exposed at `GET /metrics`:
 
 | Metric | Type | Description |
 | :--- | :--- | :--- |
-| `limiter_requests_total` | Counter | Total checks, labeled by `tenant_id`, `decision` (`allow`/`reject`), and `tier` |
-| `limiter_rejections_total` | Counter | Total rejections, labeled by `tenant_id` and `reason` |
-| `limiter_evaluation_duration_seconds` | Histogram | Request evaluation latency broken down by tier (`L1` vs `L2`) |
-| `limiter_active_calls` | Gauge | Current active concurrent calls per tenant |
-| `limiter_rollbacks_total` | Counter | Slot rollback events triggered by downstream rejections |
+| `concurrency_governor_checks_total` | Counter | Total rate limit check evaluations |
+| `concurrency_governor_decisions_total` | Counter | Evaluations labeled by `decision` (`allowed`/`rejected`) |
+| `concurrency_governor_cache_hits_total` | Counter | Lookups labeled by `layer` (`l1_memory`/`l2_redis`) |
+| `concurrency_governor_active_calls` | Gauge | Current active concurrent calls across tenants |
 
 ---
 
@@ -331,8 +346,8 @@ Prometheus metrics exposed at `GET /metrics`:
 | **L2 Distributed Limiting** | `TestL2SlidingWindowLimitEnforced`, `TestL2SlidingWindowExpiry` | Validates sliding window precision and automatic score eviction in Redis. |
 | **Lease Lifecycle** | `TestCallSlotExplicitRelease`, `TestCallSlotLeaseRenewal`, `TestCallSlotTTLExpiry` | Verifies explicit release, heartbeat renewal, and automatic garbage collection of dead calls. |
 | **Concurrency & Races** | `TestConcurrentReservationsRaceCondition`, `TestMultiGoroutineTokenBucketRace` | Fires 100 concurrent workers under Go's race detector to ensure zero double-grants. |
-| **Auth & Isolation** | `TestAuthenticateAndBindTenant`, `TestCrossTenantDataIsolation`, `TestInvalidAPIKeyRejection` | Enforces strict constant-time key validation and prevents tenant boundary bleed. |
-| **Resilience & Startup** | `TestServerFailsClosedWhenRedisDown`, `TestRedisConnectionRecovery` | Validates fail-closed crash-fast semantics on missing dependencies. |
+| **Auth & Isolation** | `TestAuthenticateAndBindTenant`, `TestCrossTenantDataIsolation`, `TestInvalidAPIKeyRejection` | Enforces strict constant-time key validation and prevents cross-tenant key leakage. |
+| **Resilience & Startup** | `TestFailClosedRedisStartup`, `TestRedisConnectionRecovery` | Validates fail-closed crash-fast semantics on missing dependencies. |
 
 ---
 
@@ -350,16 +365,17 @@ BenchmarkFullCheckInMemory     892857    1.24 µs      48 B        2 allocs
 ```
 
 ### Analysis:
-- **L1 In-Process Check (~869 ns, 0 allocs):** Lock-free integer arithmetic allows audio frame handlers to execute rate limit checks in the fast path without allocating memory or causing garbage collection pauses.
+- **L1 In-Process Check (~869 ns, 0 allocs):** Evaluates token availability entirely on the stack using atomic/mutex clock calculations, without generating heap allocations.
 - **Full Engine Check (~1.24 µs, 2 allocs):** Includes tenant auth map resolution, L1 evaluation, and IETF header generation.
 
 ---
 
-## Architectural Trade-offs
+## Limitations and Rough Edges
 
-1. **L1 Per-Instance Asymmetry:** In a multi-node gateway deployment, L1 token buckets exist independently in each pod's memory. A burst of requests balanced across 5 pods can consume up to 5x the single-node burst allowance before L2 Redis sliding window limits engage. For strict burst control, cluster-wide L2 evaluation must be selected.
-2. **Redis Single-Point-of-Failure (SPOF):** Global L2 sliding windows and call slot reservations rely on Redis. High-availability Redis Sentinel or Redis Cluster topologies are required in production to avoid gateway outages.
-3. **Static Quota Configuration:** Tenant quotas are currently configured as Go structs (Free, Growth, Enterprise). Dynamic runtime quota modifications require integrating a control-plane database or gRPC configuration listener.
+1. **L1 Per-Instance Asymmetry:** In a multi-node deployment, L1 token buckets exist independently in each pod's memory. A burst of requests balanced across $N$ pods can consume up to $N \times \text{BurstCapacity}$ before L2 Redis sliding window limits engage.
+2. **Redis Dependency for Global Coordination:** Global L2 sliding windows and call slot reservations rely on Redis. High-availability Redis Sentinel or Redis Cluster topologies are required in production to avoid gateway outages.
+3. **Static Quota Configuration:** Tenant quotas are currently configured as Go structs (Free, Growth, Enterprise). Dynamic runtime modifications require integrating a control-plane database or gRPC configuration listener.
+4. **Lua Cluster Hashtags:** Redis Cluster deployments require keys evaluated in single Lua scripts to map to the same hash slot using hashtag formatting (`{tenant_id}`).
 
 ---
 
@@ -368,9 +384,10 @@ BenchmarkFullCheckInMemory     892857    1.24 µs      48 B        2 allocs
 | Path | Description |
 | :--- | :--- |
 | `cmd/server/main.go` | HTTP server setup, fail-closed Redis ping, health endpoints, graceful shutdown |
-| `internal/limiter/engine.go` | Core rate limiting engine, Lua script definitions, reservation and rollback logic |
+| `internal/limiter/engine.go` | Core rate limiting engine, Lua scripts (`SlidingWindowScript`, `ReserveCallScript`, `ReleaseCallScript`, `RenewCallScript`), rollback logic |
 | `internal/cache/l1_cache.go` | Zero-allocation in-memory token bucket implementation with continuous refill |
-| `internal/model/types.go` | Data models: `CheckRequest`, `CheckResponse`, `TenantPolicy`, `Tier` |
+| `internal/server/server.go` | HTTP routing, authentication validation, fail-closed Redis initialization |
+| `internal/model/types.go` | Data models: `RateLimitRequest`, `RateLimitResponse`, `QuotaPolicy`, `TierLevel` |
 | `internal/metrics/metrics.go` | Prometheus metrics definitions and collectors |
 | `tests/limiter_test.go` | Comprehensive unit and integration test suite (18 tests + 2 benchmarks) |
 

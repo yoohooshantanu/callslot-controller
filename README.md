@@ -5,14 +5,14 @@
 ![Redis](https://img.shields.io/badge/Redis-7%2B-DC382D)
 ![RateLimit](https://img.shields.io/badge/RateLimit-IETF%20Draft-blue)
 
-A distributed multi-tenant rate limiter and concurrent voice call capacity governor written in Go. It sits at the ingress of telephony and voice AI infrastructure and decides in ~869 ns whether an incoming request or active call is permitted to initiate, burst, or continue.
+A distributed multi-tenant rate limiter and concurrent voice call capacity governor written in Go. It sits at the ingress of telephony and voice AI infrastructure and evaluates rate limits and concurrent call quotas using a two-tier hierarchy: a sub-microsecond in-process token bucket (L1) and a distributed Redis sliding-window with stateful call reservations (L2).
 
 *(The GitHub repo is called tenantgate. The Go module and binary are named concurrency-governor from an architectural rename.)*
 
 ### Key Technical Highlights
-- **Sub-Microsecond In-Process Fast Path:** Evaluates high-frequency streaming audio packets in ~869 ns via an in-memory lock-free token bucket (L1), absorbing traffic spikes without Redis network round-trips.
+- **Sub-Microsecond Local Burst Fast Path:** Evaluates high-frequency audio packet bursts in ~869 ns via an in-memory mutex-protected cache (`L1LocalCache`), absorbing bursts locally before global Redis evaluation.
 - **Stateful Concurrency Quotas:** Governs long-lived voice sessions via an atomic Redis Sorted Set (ZSET) script with per-reservation lease expiration, preventing trunk monopolization.
-- **Deterministic Atomic Rollback:** If a concurrency slot is granted but a downstream quota check fails, the reserved slot is automatically rolled back via Lua script, guaranteeing zero leaked capacity.
+- **Slot Rollback & Expiry Safety Net:** If a concurrency slot is reserved but downstream quota checks fail, the engine attempts an immediate rollback via `ReleaseCall`. The reservation's TTL score in Redis ZSET provides the ultimate safety net against leaked capacity.
 
 ---
 
@@ -60,10 +60,10 @@ flowchart TD
 
 | Real | Mocked or Simplified |
 | :--- | :--- |
-| **L1 in-process token bucket:** Continuous fractional refill based on elapsed nanoseconds, evaluated without network I/O. | **Static Tier Policies:** Quotas are configured as Go structs (Free, Growth, Enterprise). There is no admin API or database table for dynamic runtime policy updates. |
+| **L1 in-process token bucket (`L1LocalCache`):** Mutex-protected in-memory map tracking continuous fractional refill based on elapsed time; evaluated in ~869 ns without network I/O. | **Static Tier Policies:** Quotas are configured as Go structs (Free, Growth, Enterprise). There is no admin API or database table for dynamic runtime policy updates. |
 | **L2 distributed sliding window:** Atomic Redis Lua script (`ZREMRANGEBYSCORE`, `ZCARD`, `ZADD`) for global per-minute enforcement across instances. | **Static Key Registry:** API key to tenant ID mapping is loaded from environment variables (`TENANTGATE_API_KEYS`) on startup. No dynamic key rotation or RBAC. |
 | **Active call slot governor:** Redis ZSET with per-reservation expiry timestamps (`ReserveCallScript`, `ReleaseCallScript`, `RenewCallScript`). | **Billing Deduction:** The governor denies requests on quota exhaustion, but does not deduct credits or interact with payment gateways. |
-| **Automatic rollback:** If a call slot is reserved but L1 or L2 rejects, the slot is released before returning `429`. | |
+| **Slot rollback with TTL expiry safety net:** If a call slot is reserved but L1 or L2 rejects, `rollbackCallSlot` invokes `ReleaseCall`. If network issues interrupt the release, the reservation's Redis ZSET TTL score ensures automatic reclamation. | |
 | **Fail-closed startup:** If `REDIS_ADDR` is configured and unreachable on boot, the process terminates immediately (`os.Exit(1)`). | |
 | **IETF response headers:** `RateLimit-Limit`, `RateLimit-Remaining`, and `RateLimit-Reset` calculated on all evaluations. | |
 | **18 tests and 2 microbenchmarks**, run with `-race` against live Redis 7 containers in GitHub Actions CI. | |
@@ -106,24 +106,39 @@ flowchart TD
 
 Audio packet streams cannot tolerate a 1–2ms Redis round-trip for every 20ms frame. ConcurrencyGovernor uses a layered design:
 
-- **L1 In-Memory Token Bucket:** Absorbs high-frequency audio chunk traffic in sub-microsecond time. Refill is calculated dynamically from elapsed wall-clock nanoseconds without background ticks:
+- **L1 In-Memory Token Bucket (`L1LocalCache`):** Absorbs high-frequency audio chunk traffic in sub-microsecond time. Refill is calculated dynamically from elapsed wall-clock seconds across a mutex-protected bucket map:
 
 ```go
 // internal/cache/l1_cache.go
-func (b *TokenBucket) Allow(cost int64) bool {
-    b.mu.Lock()
-    defer b.mu.Unlock()
+func (c *L1LocalCache) AllowTokenBucket(key string, capacity int64, refillRatePerSec float64, cost int64) (allowed bool, remaining int64) {
+    c.mu.Lock()
+    defer c.mu.Unlock()
 
-    now := time.Now().UnixNano()
-    elapsed := float64(now-b.lastRefillNano) / 1e9
-    b.tokens = math.Min(float64(b.burst), b.tokens+(elapsed*b.refillRate))
-    b.lastRefillNano = now
-
-    if b.tokens >= float64(cost) {
-        b.tokens -= float64(cost)
-        return true
+    now := time.Now()
+    entry, ok := c.buckets[key]
+    if !ok {
+        entry = &TokenBucketEntry{
+            Tokens:     float64(capacity),
+            LastRefill: now,
+        }
+        c.buckets[key] = entry
     }
-    return false
+
+    elapsed := now.Sub(entry.LastRefill).Seconds()
+    if elapsed > 0 {
+        entry.Tokens += elapsed * refillRatePerSec
+        if entry.Tokens > float64(capacity) {
+            entry.Tokens = float64(capacity)
+        }
+        entry.LastRefill = now
+    }
+
+    if entry.Tokens >= float64(cost) {
+        entry.Tokens -= float64(cost)
+        return true, int64(entry.Tokens)
+    }
+
+    return false, int64(entry.Tokens)
 }
 ```
 
@@ -174,26 +189,34 @@ end
 
 If a client dies without releasing, the reservation expires automatically when `now >= expiry`.
 
-### 3. Guaranteed Slot Rollback
+### 3. Slot Rollback and Lease Expiry Safety Net
 
-When a client makes a `call.initiate` request, the call slot is reserved first. If the request subsequently fails L1 or L2 rate limits, the reserved slot is rolled back immediately:
+When a client makes a `call.initiate` request, the call slot is reserved first. If the request subsequently fails L1 burst limits, L2 sliding-window limits, or Redis connectivity, the reserved slot is rolled back immediately via `ReleaseCall`:
 
 ```go
-// internal/limiter/engine.go
-if decision.Allowed {
-    return decision, nil
-}
-
-// Downstream check failed: perform atomic rollback
-if slotReserved {
-    if err := e.rollbackCallSlot(ctx, req.TenantID, resID); err != nil {
-        logger.L.Error("failed_to_rollback_call_slot", "reservation_id", resID, "error", err)
+// internal/limiter/engine.go: rollbackCallSlot closure inside Check()
+var reservedID string
+rollbackCallSlot := func() {
+    if reservedID != "" {
+        e.ReleaseCall(req.TenantID, reservedID)
+        reservedID = ""
     }
 }
-return decision, nil
+
+// 1. If L1 burst check fails:
+if !l1Allowed {
+    rollbackCallSlot()
+    // return 429 RateLimitResponse
+}
+
+// 2. If L2 sliding-window fails or Redis is unreachable:
+if !allowed {
+    rollbackCallSlot()
+    // return 429 RateLimitResponse
+}
 ```
 
-`TestCallSlotRollbackOnRateLimitFailure` and `TestConcurrentCallCapWithRollback` verify that failed requests never leave behind dangling reservations.
+Because `rollbackCallSlot` executes `ReleaseCall` over the network, network dropouts or Redis hiccups during rollback could theoretically prevent the release command from executing. To ensure capacity does not leak permanently, ConcurrencyGovernor couples rollback with the reservation's TTL score in the Redis Sorted Set: orphaned reservations are lazily cleaned up on subsequent calls via `ZREMRANGEBYSCORE key -inf now`.
 
 ### 4. Fail-Closed Redis Startup
 
@@ -365,8 +388,8 @@ BenchmarkFullCheckInMemory     892857    1.24 µs      48 B        2 allocs
 ```
 
 ### Analysis:
-- **L1 In-Process Check (~869 ns, 0 allocs):** Evaluates token availability entirely on the stack using atomic/mutex clock calculations, without generating heap allocations.
-- **Full Engine Check (~1.24 µs, 2 allocs):** Includes tenant auth map resolution, L1 evaluation, and IETF header generation.
+- **L1 In-Process Benchmark (~869 ns, 0 allocs):** Measures the mutex-protected in-memory token bucket check (`BenchmarkL1TokenBucketAllow`). Note that this is the local fast-path cost; allowed requests that proceed to Redis for global sliding-window and reservation enforcement incur typical network round-trip latencies (~1–2 ms).
+- **Full Engine Check (~1.24 µs, 2 allocs):** Evaluates tenant auth map resolution, L1 evaluation, and IETF header generation in memory.
 
 ---
 
@@ -376,6 +399,7 @@ BenchmarkFullCheckInMemory     892857    1.24 µs      48 B        2 allocs
 2. **Redis Dependency for Global Coordination:** Global L2 sliding windows and call slot reservations rely on Redis. High-availability Redis Sentinel or Redis Cluster topologies are required in production to avoid gateway outages.
 3. **Static Quota Configuration:** Tenant quotas are currently configured as Go structs (Free, Growth, Enterprise). Dynamic runtime modifications require integrating a control-plane database or gRPC configuration listener.
 4. **Lua Cluster Hashtags:** Redis Cluster deployments require keys evaluated in single Lua scripts to map to the same hash slot using hashtag formatting (`{tenant_id}`).
+5. **Rollback Error Toleration:** The internal `rollbackCallSlot` helper calls `ReleaseCall` without retrying on network errors. While the ZSET TTL expiry score reclaims orphaned slots automatically, an unhandled rollback error temporarily holds a concurrency slot until its TTL elapses.
 
 ---
 
